@@ -1,0 +1,38 @@
+[project]
+name = "lsb-stego"
+version = "2.0.0"
+description = "Hide text or files inside images with LSB steganography - Windows XP style desktop app."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "cryptography>=42.0",
+    "tkinterdnd2>=0.4",
+]
+
+[project.scripts]
+lsb-encode = "lsb_stego.cli:encode_main"
+lsb-decode = "lsb_stego.cli:decode_main"
+
+[project.gui-scripts]
+lsb-stego = "lsb_stego.__main__:main"
+
+[tool.poetry]
+packages = [{ include = "lsb_stego" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+
+[tool.poetry.group.build]
+optional = true
+
+[tool.poetry.group.build.dependencies]
+pyinstaller = ">=6.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

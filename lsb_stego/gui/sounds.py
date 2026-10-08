@@ -1,11 +1,16 @@
-"""Windows XP style sounds: a startup chime, the button click and key taps.
+"""Windows XP style sounds: a startup chime, the button click and typing.
 
-Microsoft's own XP sound files can't ship with the app, so both sounds are
-synthesised here and cached as WAV files. To use the real ones, drop
-``startup.wav``, ``click.wav`` and/or ``key.wav`` into the ``sounds`` folder next to the
-error log (``%LOCALAPPDATA%\\LSB Steganography\\sounds``); those win. For the
-click, Windows' own "Windows Navigation Start.wav" (XP's Start.wav) is used
-when present.
+Typing has its own sound per kind of key: ordinary keys each keep a note on a
+small scale, capital letters, space/Tab, Backspace/Delete and Enter each sound
+different.
+
+Microsoft's own XP sound files can't ship with the app, so every sound is
+synthesised here and cached as WAV files. To use your own, drop any of
+``startup.wav``, ``click.wav``, ``key.wav`` (all ordinary keys), ``capital.wav``,
+``space.wav``, ``backspace.wav`` or ``enter.wav`` into the ``sounds`` folder next
+to the error log (``%LOCALAPPDATA%\\LSB Steganography\\sounds``); those win. For
+the click, Windows' own "Windows Navigation Start.wav" (XP's Start.wav) is
+used when present.
 
 Playback is Windows only, like :mod:`winapi`; every function is a silent
 no-op elsewhere or when anything goes wrong.
@@ -25,7 +30,7 @@ IS_WINDOWS = sys.platform == "win32"
 RATE = 44100
 SOUND_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "LSB Steganography" / "sounds"
 _SYSTEM_CLICK = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Media" / "Windows Navigation Start.wav"
-_VERSION = "2"  # bump when the synthesis changes so stale caches are rewritten
+_VERSION = "3"  # bump when the synthesis changes so stale caches are rewritten
 
 enabled = True
 _paths: dict[str, Path | None] = {}
@@ -99,19 +104,72 @@ def click_wav() -> bytes:
     return _wav_bytes(np.column_stack([sig, sig]))
 
 
-def key_wav() -> bytes:
-    """A soft keyboard tap for typing: quieter and duller than the click."""
-    n = int(0.03 * RATE)
+def _tap(tone: float, body: float, length: float, *, decay: float = 220, noise: float = 0.35,
+         gain: float = 0.3, sweep: float = 1.0, seed: int = 11) -> np.ndarray:
+    """One keyboard tap: a damped tone over a low body and a burst of noise.
+
+    ``sweep`` bends the tone's pitch to ``tone * sweep`` by the end.
+    """
+    n = int(length * RATE)
     t = np.arange(n) / RATE
-    rng = np.random.default_rng(11)
-    sig = 0.5 * np.sin(2 * np.pi * 1500 * t) * np.exp(-t * 220)
-    sig += 0.5 * np.sin(2 * np.pi * 420 * t) * np.exp(-t * 160)
-    sig += 0.35 * rng.uniform(-1, 1, n) * np.exp(-t * 600)
-    sig = sig / np.abs(sig).max() * 0.3
+    freq = tone * np.power(sweep, t / length)
+    phase = 2 * np.pi * np.cumsum(freq) / RATE
+    rng = np.random.default_rng(seed)
+    sig = 0.5 * np.sin(phase) * np.exp(-t * decay)
+    sig += 0.5 * np.sin(2 * np.pi * body * t) * np.exp(-t * decay * 0.7)
+    sig += noise * rng.uniform(-1, 1, n) * np.exp(-t * 600)
+    return sig / np.abs(sig).max() * gain
+
+
+def _mono(sig: np.ndarray) -> bytes:
     return _wav_bytes(np.column_stack([sig, sig]))
 
 
-_SYNTH = {"startup": startup_wav, "click": click_wav, "key": key_wav}
+# Ordinary keys share a small scale; each key always lands on the same note.
+KEY_NOTES = (1200.0, 1350.0, 1500.0, 1700.0, 1900.0, 2150.0)
+
+
+def key_wav(note: int = 2) -> bytes:
+    """A soft tap for an ordinary key, pitched at ``KEY_NOTES[note]``."""
+    return _mono(_tap(KEY_NOTES[note], 420, 0.03, seed=11 + note))
+
+
+def capital_wav() -> bytes:
+    """Capital letter: a brighter double tap, as if Shift went down too."""
+    first = _tap(2600, 520, 0.03, decay=260, gain=0.22, seed=21)
+    second = _tap(3000, 520, 0.03, decay=260, gain=0.3, seed=22)
+    gap = int(0.012 * RATE)
+    out = np.zeros(gap + len(second))
+    out[:len(first)] += first
+    out[gap:] += second
+    return _mono(out / np.abs(out).max() * 0.32)
+
+
+def space_wav() -> bytes:
+    """Space and Tab: the wide bar's deeper, longer thud."""
+    return _mono(_tap(650, 210, 0.07, decay=90, noise=0.45, gain=0.32, seed=31))
+
+
+def backspace_wav() -> bytes:
+    """Backspace and Delete: a short tap that falls in pitch."""
+    return _mono(_tap(1500, 380, 0.06, decay=120, gain=0.3, sweep=0.45, seed=41))
+
+
+def enter_wav() -> bytes:
+    """Enter: a solid 'thock' with a small XP-style ding on top."""
+    total = int(0.22 * RATE)
+    out = np.zeros(total)
+    thock = _tap(500, 160, 0.08, decay=70, noise=0.5, gain=0.35, seed=51)
+    out[:len(thock)] += thock
+    t = np.arange(total - int(0.01 * RATE)) / RATE
+    ding = (np.sin(2 * np.pi * 1318.5 * t) + 0.3 * np.sin(2 * np.pi * 2637 * t)) * np.exp(-t * 18)
+    out[int(0.01 * RATE):] += 0.12 * ding
+    return _mono(out / np.abs(out).max() * 0.35)
+
+
+_SYNTH = {"startup": startup_wav, "click": click_wav, "capital": capital_wav,
+          "space": space_wav, "backspace": backspace_wav, "enter": enter_wav,
+          **{f"key{i}": (lambda i=i: key_wav(i)) for i in range(len(KEY_NOTES))}}
 
 
 def path_for(name: str) -> Path | None:
@@ -119,8 +177,11 @@ def path_for(name: str) -> Path | None:
     if name in _paths:
         return _paths[name]
     found: Path | None = None
-    override = SOUND_DIR / f"{name}.wav"
-    if override.is_file():
+    overrides = [SOUND_DIR / f"{name}.wav"]
+    if name.startswith("key"):
+        overrides.append(SOUND_DIR / "key.wav")  # one key.wav covers every ordinary key
+    override = next((p for p in overrides if p.is_file()), None)
+    if override is not None:
         found = override
     elif name == "click" and IS_WINDOWS and _SYSTEM_CLICK.is_file():
         found = _SYSTEM_CLICK
@@ -147,37 +208,41 @@ if IS_WINDOWS:
     _winmm.mciSendStringW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
 
 
+def _play(name: str) -> None:
+    """PlaySound ``name`` asynchronously; a new sound replaces the last one."""
+    if not (enabled and IS_WINDOWS):
+        return
+    path = path_for(name)
+    if path is None:
+        return
+    try:
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except RuntimeError:
+        pass
+
+
 def play_click() -> None:
-    """Button click. Uses PlaySound, so a new click replaces the last one."""
-    if not (enabled and IS_WINDOWS):
-        return
-    path = path_for("click")
-    if path is None:
-        return
-    try:
-        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-    except RuntimeError:
-        pass
+    """Button click."""
+    _play("click")
 
 
-def play_key() -> None:
-    """Typing tap. Shares PlaySound with the click, so fast typing restarts it."""
-    if not (enabled and IS_WINDOWS):
-        return
-    path = path_for("key")
-    if path is None:
-        return
-    try:
-        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-    except RuntimeError:
-        pass
+_KEYSYM_SOUNDS = {"Return": "enter", "KP_Enter": "enter", "BackSpace": "backspace",
+                  "Delete": "backspace", "Tab": "space", "space": "space"}
 
 
-_TYPING_KEYS = {"BackSpace", "Delete", "Return", "KP_Enter", "Tab"}
+def key_sound(keysym: str, char: str) -> str | None:
+    """Which sound a key press makes, or None for keys that don't type."""
+    if keysym in _KEYSYM_SOUNDS:
+        return _KEYSYM_SOUNDS[keysym]
+    if not (char and char.isprintable()):
+        return None
+    if char.isupper():
+        return "capital"
+    return f"key{ord(char.lower()) % len(KEY_NOTES)}"
 
 
 def on_key(event) -> None:
-    """``<Key>`` handler: tap when a character is typed into an editable field."""
+    """``<Key>`` handler: play the key's sound when typing into an editable field."""
     import tkinter as tk
 
     widget = event.widget
@@ -185,8 +250,9 @@ def on_key(event) -> None:
         return
     if event.state & 0x4:  # Ctrl shortcuts (copy, paste, select all) are not typing
         return
-    if (event.char and event.char.isprintable()) or event.keysym in _TYPING_KEYS:
-        play_key()
+    name = key_sound(event.keysym, event.char)
+    if name:
+        _play(name)
 
 
 def play_startup() -> None:

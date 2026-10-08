@@ -112,6 +112,207 @@ def test_hide_validation(app_factory):
     assert not app.hide_button.enabled and app.hide_hint.cget("text").startswith("Too big")
 
 
+def test_hide_with_bpcs(app_factory, tmp_path):
+    gui_app, app = app_factory()
+    thumb = Image.new("RGB", (8, 8))
+    app.cover = gui_app.LoadedImage(gui_app.Path("c.png"), "c.png", 40, 40, "PNG", thumb, False,
+                                    bpcs_capacity=200)
+    app.message.text.insert("1.0", "hello")
+    app._compute_size()
+    app.method.set("bpcs")
+    app._refresh_hide()
+    assert app.hide_button.enabled and "BPCS" in app.hide_hint.cget("text")
+
+    app.message.text.insert("end", "".join(chr(0x4E00 + i) for i in range(300)))
+    app._compute_size()
+    assert not app.hide_button.enabled and app.hide_hint.cget("text").startswith("Too big")
+
+    app.cover = gui_app.LoadedImage(gui_app.Path("c.png"), "c.png", 40, 40, "PNG", thumb, False)
+    app._refresh_hide()
+    assert not app.hide_button.enabled and "no busy areas" in app.hide_hint.cget("text")
+
+
+def test_load_image_measures_bpcs_room(tmp_path):
+    from lsb_stego.gui import app as gui_app
+
+    src = tmp_path / "c.png"
+    Image.fromarray(np.random.default_rng(0).integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(src)
+    loaded = gui_app.load_image(src, 32, for_encoding=True)
+    assert loaded.bpcs_capacity == core.bpcs_capacity(src) > 0
+
+
+def _wait_idle(app, timeout=10.0):
+    import time
+
+    end = time.time() + timeout
+    app.root.update()
+    while app._busy and time.time() < end:
+        app.root.update()
+        time.sleep(0.02)
+    assert not app._busy
+
+
+def _textured(path):
+    rng = np.random.default_rng(1)
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(path)
+    return path
+
+
+def test_method_switch_applies_to_reveal(app_factory, tmp_path):
+    _, app = app_factory()
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("via BPCS"), tmp_path / "b.png", method="bpcs").path
+
+    app.method.set("lsb")
+    app._on_method()
+    app.load_reveal(hidden)
+    _wait_idle(app)
+    assert "(BPCS)" in app.reveal_note.cget("text")
+    assert "Switch to BPCS" in app.result_text.cget("text")
+    assert app.switch_method_button.winfo_manager() == "grid"
+
+    app.switch_method_button.invoke()  # "Use BPCS"
+    _wait_idle(app)
+    assert app.method.get() == "bpcs"
+    assert app.revealed_text.get_text() == "via BPCS"
+    assert app.text_info.cget("text").split(" · ")[1] == "BPCS"
+
+
+def test_lsb_reveal_with_bpcs_selected_offers_switch(app_factory, tmp_path):
+    _, app = app_factory()
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("via LSB"), tmp_path / "l.png").path
+    app.method.set("bpcs")
+    app._on_method()
+    app.load_reveal(hidden)
+    _wait_idle(app)
+    assert "Switch to LSB" in app.result_text.cget("text")
+    app.method.set("lsb")
+    app._on_method()
+    _wait_idle(app)
+    assert app.revealed_text.get_text() == "via LSB"
+
+
+@pytest.mark.parametrize("method", ["lsb", "bpcs"])
+def test_data_map_window(tk_root, tmp_path, method):
+    from lsb_stego.gui import datamap, theme
+
+    theme.init(tk_root)
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("map me"), tmp_path / "h.png", method=method).path
+    img = core.open_image(hidden)
+    window = datamap.DataMapWindow(tk_root, "h.png", np.asarray(img), core.locate(img))
+    try:
+        assert window.used[window.y, window.x]  # starts on the first data pixel
+        # Nothing may be drawn over the picture's edge rows, where LSB data starts,
+        # and a few hidden bytes must be called out, not left as a speck.
+        assert int(window.map.cget("highlightthickness")) == 0
+        texts = [window.map.itemcget(i, "text") for i in window.map.find_all()
+                 if window.map.type(i) == "text"]
+        assert "Hidden data is here" in texts
+        assert window.how.cget("text").startswith("LSB" if method == "lsb" else "BPCS")
+        window.move(63, 63)
+        assert (window.x, window.y) == (63, 63)
+        window.move(5, 5)  # clamped to the picture
+        assert (window.x, window.y) == (63, 63)
+    finally:
+        window.destroy()
+
+
+def _table_texts(window):
+    return [window.table.itemcget(i, "text") for i in window.table.find_all()
+            if window.table.type(i) == "text"]
+
+
+def test_data_map_before_and_after(tk_root, tmp_path):
+    from lsb_stego.gui import datamap, theme
+
+    theme.init(tk_root)
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("Meet"), tmp_path / "h.png").path
+    before = np.asarray(core.open_image(src, for_encoding=True))
+    after = np.asarray(core.open_image(hidden))
+    window = datamap.DataMapWindow(tk_root, "h.png", after, core.locate(hidden), original=before)
+    try:
+        assert window.changed[window.y, window.x]  # starts on the first changed pixel
+        texts = _table_texts(window)
+        assert "Before" in texts and "After" in texts
+        assert any(t in ("+1", "-1") for t in texts)  # LSB moves a value by one
+        assert any("marker 'L'" in t for t in texts)  # the first pixel holds the "LSB" marker
+        assert "actually changed" in window.summary.cget("text")
+        assert not window.compare_button.enabled
+        # Walk to a pixel holding message letters
+        data = core.locate(hidden)
+        letters = [(x, y) for y in range(8) for x in range(64)
+                   if any("letter 'M'" in data.describe_byte(b.byte) for b in data.hidden_bits(x, y))]
+        window.select(*letters[0])
+        assert any("of letter 'M'" in t for t in _table_texts(window))
+    finally:
+        window.destroy()
+
+
+def test_data_map_rejects_wrong_original(tk_root, tmp_path):
+    from lsb_stego.gui import datamap, theme
+
+    theme.init(tk_root)
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("x"), tmp_path / "h.png").path
+    after = np.asarray(core.open_image(hidden))
+    window = datamap.DataMapWindow(tk_root, "h.png", after, core.locate(hidden))
+    try:
+        assert "pixels, but this one" in window.check_original(np.zeros((10, 10, 3), np.uint8))
+        assert "identical" in window.check_original(after.copy())
+        other = np.asarray(core.open_image(_textured(tmp_path / "o.png")))[::-1].copy()
+        assert "doesn't look like the original" in window.check_original(other)
+        before = np.asarray(core.open_image(src, for_encoding=True))
+        assert window.check_original(before) is None
+        assert window.compare_button.enabled
+    finally:
+        window.destroy()
+
+
+def test_show_changes_after_hiding(app_factory, tmp_path, monkeypatch):
+    gui_app, app = app_factory()
+    shown = []
+    monkeypatch.setattr(gui_app.datamap, "show", lambda *args, **kw: shown.append((args, kw)))
+    src = _textured(tmp_path / "c.png")
+    cover = gui_app.load_image(src, 32, for_encoding=True)
+    result = core.encode(src, core.TextSecret("hi"), tmp_path / "h.png", method="bpcs")
+    app.show_changes(cover, result)
+    _wait_idle(app)
+    ((_root, name, after, data), kw), = shown
+    assert name == "h.png" and data.method == "bpcs"
+    assert (kw["original"] != after).any()
+
+
+def test_data_map_fit_keeps_small_data_visible():
+    from lsb_stego.gui import datamap
+
+    used = np.zeros((1000, 1500), dtype=bool)
+    used[0, 0] = True  # one pixel in a big picture
+    image, scale, shown = datamap._fit(np.zeros((1000, 1500, 3), np.uint8), used, 300, 200)
+    assert image.size == (300, 200) and scale == pytest.approx(0.2)
+    assert image.getpixel((0, 0)) == datamap.HIGHLIGHT and shown[0, 0] and shown.sum() == 1
+
+
+def test_show_where_button(app_factory, tmp_path, monkeypatch):
+    gui_app, app = app_factory()
+    shown = []
+    monkeypatch.setattr(gui_app.datamap, "show", lambda *args: shown.append(args))
+    src = _textured(tmp_path / "c.png")
+    assert not app.where_button.enabled
+    app.load_reveal(src)  # nothing hidden
+    _wait_idle(app)
+    assert not app.where_button.enabled
+    app.load_reveal(core.encode(src, core.TextSecret("x"), tmp_path / "h.png").path)
+    _wait_idle(app)
+    assert app.where_button.enabled
+    app.where_button.invoke()
+    _wait_idle(app)
+    (_root, name, rgb, data), = shown
+    assert name == "h.png" and rgb.shape[:2] == data.bits.shape[:2] and data.method == "lsb"
+
+
 def test_reveal_shows_text(app_factory, tmp_path):
     gui_app, app = app_factory()
     src = tmp_path / "c.png"

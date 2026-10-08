@@ -84,6 +84,73 @@ videos, are detected from a sample and stored as they are rather than being zipp
 * **Backward compatible:** pictures made with the original `encode.py` (red channel only,
   ending in four zero bytes) still decode. They're labelled *old format, unverified*.
 
+### BPCS mode
+
+Use the **Method: LSB / BPCS** switch at the top of the app (or answer `B` in `lsb-encode`)
+to hide and reveal with **Bit-Plane Complexity Segmentation** instead. The switch applies to
+both tabs. LSB changes the lowest bit of every channel.
+BPCS changes whole 8×8 blocks, and only where the picture already looks like noise:
+
+1. Each R, G and B value is converted to Gray code, and each of its lowest 4 bit-planes is cut
+   into 8×8 blocks.
+2. A block's *complexity* is its number of black/white borders out of 112. Blocks at 0.3 or
+   above count as noise and are replaced with 63 secret bits each.
+3. A secret block that is too simple is *conjugated* (XORed with a checkerboard) so it still
+   looks like noise, and a flag bit records it so it can be undone.
+
+Smooth areas such as sky are never touched, and no channel changes by more than 15 levels.
+How much fits depends on the picture: busy photos can hold more than LSB, while flat graphics
+and screenshots may hold nothing. The cover note shows both figures. BPCS uses the same
+header (with magic `BPC\x01`), compression, password protection and integrity check.
+**Reveal** reads with the selected method. If the picture was hidden with the other one, it
+says so and offers a one-click *Use BPCS* / *Use LSB* button. `lsb-decode` detects the method
+by itself.
+
+### See where the data is
+
+On the **Reveal** tab, **Show Where…** opens a map of the picture with every pixel that holds
+hidden data marked in red. No password is needed, because the header that says where the
+data is isn't encrypted.
+
+* **Map:** the whole picture, washed out to grey, with the data pixels in red. When the
+  picture is shrunk to fit, a single data pixel still shows.
+* **Magnifier:** the 15×15 pixels around the selected one, drawn large, with data pixels
+  outlined in red.
+* **Selected pixel:** its red, green and blue values as 8 bits each, with the bits that hold
+  hidden data filled in red. For LSB that's the lowest bit (or two). For BPCS it's one bit of
+  the Gray-coded value, in one channel only, because BPCS works on whole 8×8 blocks of a
+  single bit-plane.
+
+Click the map or the magnifier to pick a pixel, or move with the arrow keys (Shift+arrow moves 8
+pixels). **Save Map…** saves the full-size map as a PNG.
+
+### Before and after
+
+To show what changed, the window needs the original picture, because the colours from before
+hiding aren't stored anywhere. There are two ways to give it:
+
+* After **Hide Data…**, click **Show Changes** in the "now hidden" message. The app still has
+  the original, so it compares straight away.
+* In **Show Where…**, click **Compare with Original…** and choose the cover picture. The app
+  checks that it really is the original: same size, and no differences outside the hidden data.
+
+The selected pixel is then shown as a before → after table:
+
+| | Before | | After | Change | Hidden bit = which bit of the message |
+| --- | --- | --- | --- | --- | --- |
+| R | `1001111`**`0`** 158 | → | `1001111`**`0`** 158 | 0 | 0 = bit 7 of name length |
+| B | `1011010`**`1`** 181 | → | `1011010`**`0`** 180 | −1 | 0 = bit 1 of letter 'M' (**0**1001101) |
+
+* **Red** bits changed. **Amber** bits hold hidden data but already had the right value, so
+  they didn't need to change. With LSB about half the hidden bits are amber, which is why no
+  value moves by more than 1.
+* The last column says what each hidden bit is: part of the marker, the length, the CRC, or a
+  letter of the message, with that letter's 8 bits and the one stored here picked out. With a
+  password the bytes are encrypted, so it says *encrypted byte* instead.
+* For BPCS the bits are shown in Gray code, where BPCS works, with the colour values beside
+  them. A line under the table explains the block, its bit-plane, and whether it was conjugated
+  (flipped in a checkerboard pattern so it still looks like noise).
+
 ## Fixed from the original scripts
 
 * `requirements.txt` held a shell command instead of a package list. It's replaced by Poetry.
@@ -127,7 +194,8 @@ Start.wav* (the XP click) is used when available.
 
 ```
 lsb_stego/
-  core.py         engine: container format, embed/extract, legacy reader
+  core.py         engine: container format, LSB embed/extract, legacy reader
+  bpcs.py         BPCS engine: bit-plane blocks, complexity, conjugation
   crypto.py       scrypt + AES-256-GCM
   cli.py          interactive encode/decode
   gui/
@@ -137,6 +205,7 @@ lsb_stego/
     skin.py       renders every control face with Pillow
     icons.py      app icon and XP message-box icons (python -m lsb_stego.gui.icons out.ico)
     dialogs.py    XP message boxes
+    datamap.py    Show Where… window: data map, magnifier, bit view
     winapi.py     taskbar button, rounded corners, minimise (ctypes)
     sounds.py     XP-style startup chime, button click and typing taps
 tests/            pytest suite

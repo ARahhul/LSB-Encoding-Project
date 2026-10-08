@@ -50,8 +50,16 @@ def _encode() -> int:
         return 1
     room = core.capacity(image_path, core.MAX_DEPTH) - core.HEADER.size
     best = core.capacity(image_path, 1) - core.HEADER.size
-    print(f"ℹ️ This image can hide up to {room:,} bytes "
+    bpcs_room = max(0, core.bpcs_capacity(image_path) - core.HEADER.size)
+    print(f"ℹ️ LSB can hide up to {room:,} bytes "
           f"(up to {best:,} at 1 bit per channel, the least visible).")
+    print(f"ℹ️ BPCS can hide up to {bpcs_room:,} bytes, in the picture's busy areas only.")
+
+    method = input("Method: (L)SB or (B)PCS? [L] ").strip().lower() or "l"
+    if method not in ("l", "b"):
+        print("❌ Invalid choice. Please enter 'L' or 'B'.")
+        return 1
+    method = "bpcs" if method == "b" else "lsb"
 
     choice = input("Do you want to hide (T)ext or (F)ile? ").strip().lower()
     if choice == "t":
@@ -73,11 +81,12 @@ def _encode() -> int:
 
     default = f"{Path(image_path).stem}_hidden.png"
     output = _ask(f"Enter output image filename [{default}]: ") or default
-    result = core.encode(image_path, secret, output, password or None)
+    result = core.encode(image_path, secret, output, password or None, method=method)
     if result.renamed:
         print("ℹ️ Saved as PNG: lossy formats such as JPEG would destroy the hidden data.")
+    how = "BPCS" if result.method == "bpcs" else f"LSB, {result.depth} bit per channel"
     print(f"✅ Data encoded and saved to {result.path} "
-          f"({result.used:,} of {result.capacity:,} bytes used, {result.depth} bit per channel)")
+          f"({result.used:,} of {result.capacity:,} bytes used, {how})")
     return 0
 
 
@@ -100,6 +109,8 @@ def _decode() -> int:
 
     if revealed.legacy:
         print("ℹ️ Old format: there is no integrity check, so the result may be noise.")
+    else:
+        print(f"ℹ️ Hidden with {revealed.method.upper()}.")
     if revealed.is_text:
         print("\n🔓 Recovered text content:\n")
         print(revealed.text)

@@ -18,6 +18,10 @@ by at most 3/255.
 All integers are big-endian. The CRC covers ``blob`` as stored, so damage is
 reported as corruption rather than as a wrong password.
 
+BPCS mode (``method="bpcs"``, see :mod:`bpcs`) stores the same header and
+blob, with magic ``BPC\\x01`` and no depth bits, inside the picture's noisy
+8x8 bit-plane blocks instead. :func:`decode` tells the two apart by magic.
+
 Images written by the original ``encode.py`` (red channel only, terminated by
 four NUL bytes) are still readable; see :func:`_decode_legacy`.
 """
@@ -34,7 +38,7 @@ from typing import Union
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import crypto
+from . import bpcs, crypto
 from .errors import (
     CapacityError,
     CorruptDataError,
@@ -44,6 +48,8 @@ from .errors import (
 )
 
 MAGIC = b"LSB\x02"
+MAGIC_BPCS = b"BPC\x01"
+METHODS = ("lsb", "bpcs")
 HEADER = struct.Struct(">4sBII")
 _INNER = struct.Struct(">BH")
 
@@ -90,6 +96,7 @@ class Revealed:
     encrypted: bool = False
     compressed: bool = False
     legacy: bool = False      # written by the original encode.py: no integrity check
+    method: str = "lsb"       # "lsb" or "bpcs"
 
     @property
     def is_text(self) -> bool:
@@ -101,12 +108,155 @@ class Revealed:
 
 
 @dataclass(frozen=True)
+class HiddenBit:
+    """One hidden bit inside one colour value (see :meth:`DataMap.hidden_bits`)."""
+    channel: int               # 0 red, 1 green, 2 blue
+    plane: int                 # bit position in the value, 0 = last bit (Gray-coded for BPCS)
+    index: int | None = None   # position in the hidden stream; None for flag/padding bits
+    kind: str = "data"         # "data", "flag" (BPCS conjugation flag) or "padding"
+    inverted: bool = False     # BPCS: this bit is stored flipped (conjugated block, checkerboard 1)
+    conjugated: bool = False   # BPCS: the whole block was conjugated
+
+    @property
+    def byte(self) -> int:
+        return (self.index or 0) // 8
+
+    @property
+    def bit(self) -> int:
+        """0 = the byte's most significant (leftmost) bit."""
+        return (self.index or 0) % 8
+
+
+@dataclass(frozen=True)
+class DataMap:
+    """Which bits of which pixels hold hidden data (see :func:`locate`).
+
+    ``bits[y, x, c]`` is a mask over the 8 bits of channel ``c`` (R, G, B) of
+    the pixel at (x, y): bit ``k`` set means bit ``k`` carries hidden data. For
+    BPCS those are the bits of the Gray-coded value, which is where BPCS works.
+    """
+    method: str           # "lsb", "bpcs" or "legacy"
+    bits: np.ndarray      # (height, width, 3) uint8
+    used: int             # bytes stored, header included
+    depth: int = 1        # LSB: bits per channel for the payload
+    blocks: int = 0       # BPCS: 8x8 blocks holding data
+    stream: bytes = b""   # what is stored, in order: header + blob (old format: data + NULs)
+    order: tuple = ()     # BPCS: (plane, channel, block indices, conjugated) in embedding order
+
+    @property
+    def gray(self) -> bool:
+        return self.method == "bpcs"
+
+    def hidden_bits(self, x: int, y: int) -> list[HiddenBit]:
+        """The hidden bits in pixel (x, y), with their place in :attr:`stream`."""
+        h, w = self.bits.shape[:2]
+        found: list[HiddenBit] = []
+        if self.method == "lsb":
+            payload_bits = (self.used - HEADER.size) * 8
+            for c in range(3):
+                s = (y * w + x) * 3 + c
+                if s < _HEADER_SAMPLES:
+                    found.append(HiddenBit(c, 0, s))
+                    continue
+                for j in range(self.depth):
+                    b = (s - _HEADER_SAMPLES) * self.depth + j
+                    if b < payload_bits:
+                        found.append(HiddenBit(c, self.depth - 1 - j, _HEADER_SAMPLES + b))
+        elif self.method == "legacy":
+            s = y * w + x
+            if s < self.used * 8:
+                found.append(HiddenBit(0, 0, s))
+        elif self.method == "bpcs":
+            blocks_across = w // bpcs.BLOCK
+            if x >= blocks_across * bpcs.BLOCK or y >= h // bpcs.BLOCK * bpcs.BLOCK:
+                return found
+            block = (y // bpcs.BLOCK) * blocks_across + x // bpcs.BLOCK
+            row, col = y % bpcs.BLOCK, x % bpcs.BLOCK
+            pos = row * bpcs.BLOCK + col
+            offset = 0
+            for plane, channel, take, conjugated in self.order:
+                i = int(np.searchsorted(take, block))
+                if i < take.size and take[i] == block:
+                    conj = bool(conjugated[i])
+                    if pos == 0:
+                        found.append(HiddenBit(channel, plane, kind="flag", conjugated=conj))
+                    else:
+                        b = (offset + i) * bpcs.DATA_BITS + pos - 1
+                        flipped = conj and bool(bpcs.CHECKERBOARD[row, col])
+                        if b < self.used * 8:
+                            found.append(HiddenBit(channel, plane, b, inverted=flipped, conjugated=conj))
+                        else:
+                            found.append(HiddenBit(channel, plane, kind="padding", inverted=flipped,
+                                                   conjugated=conj))
+                offset += take.size
+        return sorted(found, key=lambda bit: (bit.channel, -bit.plane))
+
+    def describe_byte(self, index: int) -> str:
+        """What byte ``index`` of :attr:`stream` is, in a few words."""
+        def char(b: int) -> str:
+            ch = chr(b)
+            return {" ": "space", "\n": "line break", "\t": "tab"}.get(
+                ch, f"'{ch}'" if ch.isprintable() and b < 128 else f"0x{b:02X}")
+
+        data = self.stream
+        if self.method == "legacy":
+            if index >= self.used - len(LEGACY_TERMINATOR):
+                return "end marker"
+            return f"letter {char(data[index])}" if data[index] < 128 else "file byte"
+        if index < 4:
+            return f"marker {char(data[index])}"
+        if index == 4:
+            return "flags byte"
+        if index < 9:
+            return "length field"
+        if index < HEADER.size:
+            return "CRC-32 check"
+        flags = data[4]
+        k = index - HEADER.size
+        if flags & FLAG_ENCRYPTED:
+            return "encrypted byte"
+        if flags & FLAG_COMPRESSED:
+            return "compressed byte"
+        kind, name_len = _INNER.unpack_from(data, HEADER.size)
+        if k == 0:
+            return "text/file type"
+        if k < _INNER.size:
+            return "name length"
+        if k < _INNER.size + name_len:
+            return f"name letter {char(data[index])}"
+        if kind != KIND_TEXT:
+            return "file byte"
+        body = data[HEADER.size + _INNER.size + name_len:]
+        start = k - _INNER.size - name_len
+        while start > 0 and body[start] & 0xC0 == 0x80:  # back up to the start of a UTF-8 character
+            start -= 1
+        size = 1
+        while start + size < len(body) and body[start + size] & 0xC0 == 0x80:
+            size += 1
+        if size == 1:
+            return f"letter {char(body[start])}"
+        return f"letter '{body[start:start + size].decode('utf-8', errors='replace')}'"
+
+    @property
+    def pixels(self) -> int:
+        """Pixels with at least one hidden bit."""
+        return int(np.count_nonzero(self.bits.any(axis=2)))
+
+    @property
+    def planes(self) -> list[int]:
+        """Bit positions in use, lowest first."""
+        used = int(np.bitwise_or.reduce(self.bits, axis=None)) if self.bits.size else 0
+        return [k for k in range(8) if used >> k & 1]
+
+
+@dataclass(frozen=True)
 class EncodeResult:
     path: Path
     used: int          # bytes written, header included
     capacity: int      # bytes the image could hold at ``depth``
     renamed: bool      # the requested extension was replaced with .png
-    depth: int = 1     # bits per channel used for the payload
+    depth: int = 1     # bits per channel used for the payload (LSB only)
+    method: str = "lsb"
 
 
 # --------------------------------------------------------------------- images
@@ -150,6 +300,11 @@ def capacity(source: ImageSource, depth: int = MAX_DEPTH) -> int:
         with Image.open(source) as img:
             width, height = img.size
     return capacity_for_size(width, height, depth)
+
+
+def bpcs_capacity(source: ImageSource) -> int:
+    """Bytes (header included) BPCS can hide. Depends on the picture's content."""
+    return bpcs.capacity(np.asarray(open_image(source, for_encoding=True), dtype=np.uint8))
 
 
 def depth_needed(size: int, width: int, height: int, max_depth: int = MAX_DEPTH) -> int | None:
@@ -197,6 +352,10 @@ def _header(flags: int, blob: bytes, depth: int) -> bytes:
     return HEADER.pack(MAGIC, flags | ((depth - 1) << DEPTH_SHIFT), len(blob), zlib.crc32(blob))
 
 
+def _bpcs_header(flags: int, blob: bytes) -> bytes:
+    return HEADER.pack(MAGIC_BPCS, flags, len(blob), zlib.crc32(blob))
+
+
 def build_container(secret: Secret, password: str | None = None, depth: int = 1) -> bytes:
     blob, flags = _blob(secret, password)
     return _header(flags, blob, depth) + blob
@@ -208,7 +367,7 @@ def container_size(secret: Secret, password: str | None = None) -> int:
     return HEADER.size + len(blob) + (crypto.OVERHEAD if password else 0)
 
 
-def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool) -> Revealed:
+def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool, method: str = "lsb") -> Revealed:
     if len(inner) < _INNER.size:
         raise CorruptDataError("The hidden content is truncated.")
     kind, name_len = _INNER.unpack_from(inner)
@@ -222,6 +381,7 @@ def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool) -> Revealed
         name=name,
         encrypted=encrypted,
         compressed=compressed,
+        method=method,
     )
 
 
@@ -274,25 +434,44 @@ def _read(carrier: np.ndarray, start: int, count: int, depth: int) -> bytes:
 # ------------------------------------------------------------------- public
 
 def encode(cover: ImageSource, secret: Secret, out_path: str | os.PathLike,
-           password: str | None = None, *, max_depth: int = MAX_DEPTH) -> EncodeResult:
+           password: str | None = None, *, max_depth: int = MAX_DEPTH,
+           method: str = "lsb") -> EncodeResult:
     """Hide ``secret`` in ``cover`` and write a lossless PNG to ``out_path``.
 
-    Uses 1 bit per channel when the secret fits and up to ``max_depth`` bits
-    when it doesn't. Any extension other than ``.png`` is replaced, because
-    lossy formats such as JPEG would destroy the hidden bits.
+    ``method`` is ``"lsb"`` (default) or ``"bpcs"``. LSB uses 1 bit per
+    channel when the secret fits and up to ``max_depth`` bits when it
+    doesn't. BPCS hides in the picture's noisy areas only; see :mod:`bpcs`.
+    Any extension other than ``.png`` is replaced, because lossy formats
+    such as JPEG would destroy the hidden bits.
     """
+    if method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
     img = open_image(cover, for_encoding=True)
     blob, flags = _blob(secret, password)
     size = HEADER.size + len(blob)
-    depth = depth_needed(size, *img.size, max_depth=max_depth)
-    if depth is None:
-        raise CapacityError(size, capacity_for_size(*img.size, max_depth))
-
     arr = np.array(img, dtype=np.uint8)
-    samples = arr[..., :3].reshape(-1)
-    _write(samples, 0, _header(flags, blob, depth), 1)
-    _write(samples, _HEADER_SAMPLES, blob, depth)
-    arr[..., :3] = samples.reshape(arr.shape[0], arr.shape[1], 3)
+
+    if method == "bpcs":
+        # BPCS only rewrites noisy blocks, so an earlier LSB header in a smooth
+        # area would survive and be read first. Break its magic before BPCS
+        # picks its blocks (so the change can't shift them).
+        samples = arr[..., :3].reshape(-1)
+        if samples.size >= _HEADER_SAMPLES and _read(samples, 0, len(MAGIC), 1) == MAGIC:
+            arr[0, 0, 0] ^= 1
+        room = bpcs.capacity(arr)
+        if size > room:
+            raise CapacityError(size, room)
+        bpcs.embed(arr, _bpcs_header(flags, blob) + blob)
+        depth = 1
+    else:
+        depth = depth_needed(size, *img.size, max_depth=max_depth)
+        if depth is None:
+            raise CapacityError(size, capacity_for_size(*img.size, max_depth))
+        samples = arr[..., :3].reshape(-1)
+        _write(samples, 0, _header(flags, blob, depth), 1)
+        _write(samples, _HEADER_SAMPLES, blob, depth)
+        arr[..., :3] = samples.reshape(arr.shape[0], arr.shape[1], 3)
+        room = capacity_for_size(*img.size, depth)
 
     out = Path(out_path)
     renamed = out.suffix.lower() != ".png"
@@ -300,48 +479,138 @@ def encode(cover: ImageSource, secret: Secret, out_path: str | os.PathLike,
         out = out.with_suffix(".png")
     out.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(out, format="PNG", compress_level=PNG_LEVEL)
-    return EncodeResult(out, size, capacity_for_size(*img.size, depth), renamed, depth)
+    return EncodeResult(out, size, room, renamed, depth, method)
+
+
+def _bpcs_header_of(img: Image.Image) -> tuple[np.ndarray, tuple] | None:
+    """The pixel array and unpacked BPCS header, if the picture has one."""
+    arr = np.asarray(img, dtype=np.uint8)
+    try:
+        header = HEADER.unpack(bpcs.extract(arr, HEADER.size))
+    except ValueError:
+        return None
+    return (arr, header) if header[0] == MAGIC_BPCS else None
+
+
+def detect_method(source: ImageSource) -> str | None:
+    """``"lsb"`` or ``"bpcs"`` for a picture holding a container, else None."""
+    img = open_image(source)
+    carrier = _carrier(img)
+    if carrier.size >= _HEADER_SAMPLES and _read(carrier, 0, len(MAGIC), 1) == MAGIC:
+        return "lsb"
+    return "bpcs" if _bpcs_header_of(img) is not None else None
 
 
 def has_container(source: ImageSource) -> bool:
-    carrier = _carrier(open_image(source))
-    if carrier.size < _HEADER_SAMPLES:
-        return False
-    return _read(carrier, 0, len(MAGIC), 1) == MAGIC
+    return detect_method(source) is not None
 
 
-def decode(source: ImageSource, password: str | None = None) -> Revealed:
-    """Extract whatever :func:`encode` (or the original ``encode.py``) hid."""
+def _open_blob(flags: int, blob: bytes, crc: int, password: str | None,
+               method: str) -> Revealed:
+    """Check, decrypt and decompress a stored blob (shared by LSB and BPCS)."""
+    if zlib.crc32(blob) != crc:
+        raise CorruptDataError(
+            "The hidden content is damaged. The image was probably edited, "
+            "resized or re-saved in a lossy format after the data was hidden."
+        )
+    encrypted = bool(flags & FLAG_ENCRYPTED)
+    compressed = bool(flags & FLAG_COMPRESSED)
+    if encrypted:
+        if not password:
+            raise PasswordRequiredError("This content is protected by a password.")
+        blob = crypto.decrypt(blob, password, aad=MAGIC)
+    if compressed:
+        try:
+            inflater = zlib.decompressobj()
+            blob = inflater.decompress(blob, MAX_DECOMPRESSED)
+        except zlib.error as exc:
+            raise CorruptDataError("The hidden content could not be decompressed.") from exc
+    return _parse_inner(blob, encrypted=encrypted, compressed=compressed, method=method)
+
+
+def decode(source: ImageSource, password: str | None = None, *,
+           method: str | None = None) -> Revealed:
+    """Extract whatever :func:`encode` (or the original ``encode.py``) hid.
+
+    ``method`` limits the search to ``"lsb"`` (which includes the original
+    format) or ``"bpcs"``; by default both are tried and told apart by magic.
+    """
+    if method is not None and method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
     img = open_image(source)
     carrier = _carrier(img)
 
-    if carrier.size >= _HEADER_SAMPLES:
+    if method != "bpcs" and carrier.size >= _HEADER_SAMPLES:
         magic, flags, length, crc = HEADER.unpack(_read(carrier, 0, HEADER.size, 1))
         if magic == MAGIC:
             depth = ((flags & DEPTH_MASK) >> DEPTH_SHIFT) + 1
             if length > capacity_for_size(*img.size, depth) - HEADER.size:
                 raise CorruptDataError("The hidden content's length is larger than the image.")
             blob = _read(carrier, _HEADER_SAMPLES, length, depth)
-            if zlib.crc32(blob) != crc:
-                raise CorruptDataError(
-                    "The hidden content is damaged. The image was probably edited, "
-                    "resized or re-saved in a lossy format after the data was hidden."
-                )
-            encrypted = bool(flags & FLAG_ENCRYPTED)
-            compressed = bool(flags & FLAG_COMPRESSED)
-            if encrypted:
-                if not password:
-                    raise PasswordRequiredError("This content is protected by a password.")
-                blob = crypto.decrypt(blob, password, aad=MAGIC)
-            if compressed:
-                try:
-                    inflater = zlib.decompressobj()
-                    blob = inflater.decompress(blob, MAX_DECOMPRESSED)
-                except zlib.error as exc:
-                    raise CorruptDataError("The hidden content could not be decompressed.") from exc
-            return _parse_inner(blob, encrypted=encrypted, compressed=compressed)
+            return _open_blob(flags, blob, crc, password, "lsb")
 
+    found = _bpcs_header_of(img) if method != "lsb" else None
+    if found is not None:
+        arr, (_magic, flags, length, crc) = found
+        if length > carrier.size // 2:  # BPCS can never use more than half the bits
+            raise CorruptDataError("The hidden content's length is larger than the image.")
+        try:
+            blob = bpcs.extract(arr, HEADER.size + length)[HEADER.size:]
+        except ValueError as exc:
+            raise CorruptDataError("The hidden content runs past the end of the image.") from exc
+        return _open_blob(flags, blob, crc, password, "bpcs")
+
+    if method == "bpcs":
+        raise NoHiddenDataError()
     return _decode_legacy(img)
+
+
+def locate(source: ImageSource, *, method: str | None = None) -> DataMap:
+    """Map where :func:`decode` would find hidden data, bit by bit.
+
+    No password is needed: the header that says where the data is isn't
+    encrypted. Raises :class:`NoHiddenDataError` if there is nothing to map.
+    """
+    if method is not None and method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
+    img = open_image(source)
+    carrier = _carrier(img)
+    h, w = img.height, img.width
+
+    if method != "bpcs" and carrier.size >= _HEADER_SAMPLES:
+        magic, flags, length, _crc = HEADER.unpack(_read(carrier, 0, HEADER.size, 1))
+        if magic == MAGIC:
+            depth = ((flags & DEPTH_MASK) >> DEPTH_SHIFT) + 1
+            if length > capacity_for_size(w, h, depth) - HEADER.size:
+                raise CorruptDataError("The hidden content's length is larger than the image.")
+            flat = np.zeros(carrier.size, dtype=np.uint8)
+            flat[:_HEADER_SAMPLES] = 1
+            end = _HEADER_SAMPLES + -(-length * 8 // depth)
+            flat[_HEADER_SAMPLES:end] = (1 << depth) - 1
+            stream = _read(carrier, 0, HEADER.size, 1) + _read(carrier, _HEADER_SAMPLES, length, depth)
+            return DataMap("lsb", flat.reshape(h, w, 3), HEADER.size + length, depth, stream=stream)
+
+    found = _bpcs_header_of(img) if method != "lsb" else None
+    if found is not None:
+        arr, (_magic, _flags, length, _crc) = found
+        try:
+            bits, order = bpcs.bit_map(arr, HEADER.size + length)
+            stream = bpcs.extract(arr, HEADER.size + length)
+        except ValueError as exc:
+            raise CorruptDataError("The hidden content runs past the end of the image.") from exc
+        return DataMap("bpcs", bits, HEADER.size + length, blocks=sum(o[2].size for o in order),
+                       stream=stream, order=tuple(order))
+
+    if method == "bpcs":
+        raise NoHiddenDataError()
+    _decode_legacy(img)  # raises NoHiddenDataError unless the old format is plausible
+    red = np.asarray(img, dtype=np.uint8)[..., 0].reshape(-1)
+    usable = red.size - red.size % 8
+    raw = np.packbits(red[:usable] & 1).tobytes()
+    stored = raw.find(LEGACY_TERMINATOR) + len(LEGACY_TERMINATOR)
+    bits = np.zeros((h * w, 3), dtype=np.uint8)
+    bits[:stored * 8, 0] = 1
+    return DataMap("legacy", bits.reshape(h, w, 3), stored, stream=raw[:stored])
 
 
 # -------------------------------------------------------------------- legacy

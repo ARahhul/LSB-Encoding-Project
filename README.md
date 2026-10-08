@@ -104,6 +104,14 @@ videos, are detected from a sample and stored as they are rather than being zipp
   but not the fact that something is hidden.
 * The GUI accepts secret files up to 100 MB. The cover picture sets the real limit.
 
+## Sounds
+
+On Windows the app plays an XP-style startup chime when it opens and a click when you press a
+button. Both are synthesised by the app (Microsoft's own XP sound files can't be bundled). To
+use the real ones, copy them to `%LOCALAPPDATA%\LSB Steganography\sounds\` as `startup.wav`
+and `click.wav`. If no `click.wav` is there, Windows' own *Windows Navigation Start.wav* (the
+XP click) is used when available.
+
 ## Project layout
 
 ```
@@ -119,5 +127,6 @@ lsb_stego/
     icons.py      app icon and XP message-box icons (python -m lsb_stego.gui.icons out.ico)
     dialogs.py    XP message boxes
     winapi.py     taskbar button, rounded corners, minimise (ctypes)
+    sounds.py     XP-style startup chime and button click
 tests/            pytest suite
 ```

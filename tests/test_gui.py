@@ -128,8 +128,21 @@ def test_sounds_synthesise_valid_wavs():
 
     from lsb_stego.gui import sounds
 
-    for make, min_secs, max_secs in ((sounds.startup_wav, 3.0, 6.0), (sounds.click_wav, 0.01, 0.2),
-                                     (sounds.key_wav, 0.01, 0.2)):
+    for name, make in sounds._SYNTH.items():
+        min_secs, max_secs = (3.0, 6.0) if name == "startup" else (0.01, 0.3)
         with wave.open(io.BytesIO(make())) as w:
             assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (2, 2, sounds.RATE)
-            assert min_secs <= w.getnframes() / w.getframerate() <= max_secs
+            assert min_secs <= w.getnframes() / w.getframerate() <= max_secs, name
+
+
+def test_each_kind_of_key_has_its_own_sound():
+    from lsb_stego.gui.sounds import key_sound
+
+    assert key_sound("Return", "\r") == "enter"
+    assert key_sound("BackSpace", "\b") == key_sound("Delete", "\x7f") == "backspace"
+    assert key_sound("space", " ") == key_sound("Tab", "\t") == "space"
+    assert key_sound("A", "A") == "capital"
+    assert key_sound("a", "a").startswith("key")
+    assert key_sound("a", "a") == key_sound("a", "a")  # a key always plays the same note
+    assert len({key_sound(c, c) for c in "asdfgh"}) > 1  # but keys differ from each other
+    assert key_sound("Shift_L", "") is None

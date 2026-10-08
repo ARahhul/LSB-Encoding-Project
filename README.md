@@ -107,11 +107,21 @@ videos, are detected from a sample and stored as they are rather than being zipp
 ## Sounds
 
 On Windows the app plays an XP-style startup chime when it opens, a click when you press a
-button and a soft key tap as you type in a text box. All three are synthesised by the app
-(Microsoft's own XP sound files can't be bundled). To use your own, copy them to
-`%LOCALAPPDATA%\LSB Steganography\sounds\` as `startup.wav`, `click.wav` and `key.wav`. If no
-`click.wav` is there, Windows' own *Windows Navigation Start.wav* (the XP click) is used when
-available.
+button, and key sounds as you type in a text box. Each kind of key sounds different:
+
+| Key | Sound |
+| --- | --- |
+| Letters, digits, symbols | a soft tap; each key always plays its own note |
+| Capital letters | a brighter double tap |
+| Space, Tab | a deeper thud |
+| Backspace, Delete | a tap that falls in pitch |
+| Enter | a solid "thock" with a small ding |
+
+All the sounds are synthesised by the app (Microsoft's own XP sound files can't be bundled).
+To use your own, copy WAV files into `%LOCALAPPDATA%\LSB Steganography\sounds\` named
+`startup.wav`, `click.wav`, `key.wav` (all ordinary keys), `capital.wav`, `space.wav`,
+`backspace.wav` or `enter.wav`. If no `click.wav` is there, Windows' own *Windows Navigation
+Start.wav* (the XP click) is used when available.
 
 ## Project layout
 

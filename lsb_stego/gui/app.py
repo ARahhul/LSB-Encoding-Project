@@ -48,6 +48,7 @@ from .widgets import (
 
 APP_NAME = "LSB Steganography"
 APP_ID = "LSBSteganography.Desktop.2"
+METHOD_NAMES = {"lsb": "LSB", "bpcs": "BPCS"}
 MAX_SECRET_FILE = 100 * 1024 * 1024
 IMAGE_TYPES = [
     ("Image files", "*.png *.bmp *.tif *.tiff *.webp *.gif *.jpg *.jpeg"),
@@ -119,6 +120,9 @@ class LoadedImage:
     fmt: str
     thumb: Image.Image
     has_data: bool
+    bpcs_capacity: int = 0          # BPCS room depends on the picture's content
+    data_method: str | None = None  # "lsb" or "bpcs" when has_data
+
 
     @property
     def capacity(self) -> int:
@@ -146,12 +150,14 @@ def load_image(source: Path | Image.Image, thumb_px: int, *, for_encoding: bool)
     size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
     # reducing_gap box-shrinks first, so a 12+ MP photo thumbnails in milliseconds.
     thumb = img.resize(size, Image.Resampling.LANCZOS, reducing_gap=3.0)
-    carrier_has_data = False
+    data_method = None
     try:
-        carrier_has_data = core.has_container(img)
+        data_method = core.detect_method(img)
     except StegoError:
         pass
-    return LoadedImage(source, name, img.width, img.height, fmt, thumb, carrier_has_data)
+    bpcs_room = core.bpcs_capacity(img) if for_encoding else 0
+    return LoadedImage(source, name, img.width, img.height, fmt, thumb, data_method is not None,
+                       bpcs_room, data_method)
 
 
 class Worker:
@@ -202,6 +208,7 @@ class App:
         # Hide page state
         self.cover: LoadedImage | None = None
         self.secret_mode = tk.StringVar(root, value="text")
+        self.method = tk.StringVar(root, value="lsb")
         self.secret_file: Path | None = None
         self.secret_file_data: bytes | None = None
         self.use_password = tk.BooleanVar(root, value=False)
@@ -225,6 +232,7 @@ class App:
         self._refresh_hide()
         self._show_reveal_state("empty")
         self.reveal_button.set_enabled(False)
+        self._update_method_hint()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._present()
         if initial:
@@ -234,6 +242,15 @@ class App:
     def _build(self, body: tk.Frame) -> None:
         outer = tk.Frame(body, bg=T.DIALOG_BG)
         outer.pack(fill="both", expand=True, padx=T.px(8), pady=(T.px(8), 0))
+        switch = tk.Frame(outer, bg=T.DIALOG_BG)
+        switch.pack(fill="x", padx=T.px(2), pady=(0, T.px(6)))
+        label(switch, "Method:").pack(side="left")
+        XPRadio(switch, "LSB", self.method, "lsb", command=self._on_method).pack(
+            side="left", padx=(T.px(8), 0))
+        XPRadio(switch, "BPCS", self.method, "bpcs", command=self._on_method).pack(
+            side="left", padx=(T.px(14), 0))
+        self.method_hint = label(switch, "", fg=T.TEXT_MUTED, anchor="e")
+        self.method_hint.pack(side="right")
         self.tabs = XPTabs(outer, on_change=self._on_tab_change)
         self.tabs.pack(fill="both", expand=True)
         hide_page = self.tabs.add("Hide")
@@ -397,6 +414,8 @@ class App:
         self.result_text = label(self.result_message, "", anchor="w", justify="left", wraplength=T.px(300))
         self.result_text.grid(row=0, column=1, sticky="ew")
         self.extract_anyway = XPButton(self.result_message, "Extract Anyway", command=self._extract_legacy)
+        self.switch_method_button = XPButton(self.result_message, "Use BPCS",
+                                             command=self._use_detected_method)
 
         # revealed text
         self.result_textpanel = tk.Frame(rb, bg=bg)
@@ -535,6 +554,26 @@ class App:
 
         self.worker.run(job, done, lambda exc: self.load_cover(path))
 
+    # ============================================================ method
+    def _update_method_hint(self) -> None:
+        self.method_hint.configure(text="Hides in every pixel's lowest bits"
+                                   if self.method.get() == "lsb"
+                                   else "Hides in the picture's busy areas only")
+
+    def _on_method(self) -> None:
+        """The LSB/BPCS switch applies to both pages."""
+        self._update_method_hint()
+        self.status.set(f"Method: {METHOD_NAMES[self.method.get()]}.")
+        self._refresh_hide()
+        if self.inspected is not None:
+            self._show_reveal_note(self.inspected)
+            self.reveal(auto=True)
+
+    def _use_detected_method(self) -> None:
+        if self.inspected is not None and self.inspected.data_method:
+            self.method.set(self.inspected.data_method)
+            self._on_method()
+
     # ============================================================ hide page
     def browse_cover(self) -> None:
         path = filedialog.askopenfilename(parent=self.root, title="Choose a Cover Image",
@@ -565,7 +604,9 @@ class App:
             self.cover_zone.set_image(loaded.thumb)
             self.cover_name.configure(text=ellipsize(loaded.name, T.FONT_BOLD, T.px(250)))
             self.cover_details.configure(text=f"{loaded.width:,} × {loaded.height:,} pixels · {loaded.fmt}")
-            notes = [f"Can hide up to {human_size(loaded.capacity - core.HEADER.size)}."]
+            bpcs_room = max(0, loaded.bpcs_capacity - core.HEADER.size)
+            notes = [f"Can hide up to {human_size(loaded.capacity - core.HEADER.size)} with LSB, "
+                     f"{human_size(bpcs_room)} with BPCS."]
             if loaded.has_data:
                 notes.append("Already holds hidden data; it will be replaced.")
             elif loaded.fmt.upper() in LOSSY_FORMATS:
@@ -675,14 +716,18 @@ class App:
     def _refresh_hide(self, measuring: bool = False) -> None:
         if not hasattr(self, "hide_button"):
             return
-        cap = self.cover.capacity if self.cover else 0
+        use_bpcs = self.method.get() == "bpcs"
+        cap = (self.cover.bpcs_capacity if use_bpcs else self.cover.capacity) if self.cover else 0
         need = self.needed
         depth = core.depth_needed(need, self.cover.width, self.cover.height) \
-            if self.cover and need is not None else None
+            if self.cover and need is not None and not use_bpcs else None
         if cap and need is not None:
             fraction = need / cap
-            # Green: 1 bit per channel. Yellow: 2 bits (still invisible). Red: doesn't fit.
-            color = "red" if depth is None else ("yellow" if depth > 1 else "green")
+            # Green: 1 bit per channel (or BPCS). Yellow: 2 bits (still invisible). Red: doesn't fit.
+            if use_bpcs:
+                color = "red" if need > cap else "green"
+            else:
+                color = "red" if depth is None else ("yellow" if depth > 1 else "green")
             self.meter.set(min(1.0, fraction), color)
             percent = f"{fraction:.0%}" if fraction >= 0.01 else "<1%"
             self.meter_text.configure(text=f"{human_size(need)} ({percent})", fg=T.TEXT_ERROR if need > cap else T.TEXT)
@@ -701,14 +746,20 @@ class App:
                 else "Choose the file to hide."
         elif measuring or need is None:
             problem = "Measuring…"
+        elif use_bpcs and not cap:
+            problem = "This picture has no busy areas for BPCS. Use LSB or a more detailed photo."
         elif need > cap:
-            problem = f"Too big by {human_size(need - cap)}. Try a bigger image."
+            problem = f"Too big by {human_size(need - cap)}. " + \
+                ("Try LSB or a more detailed image." if use_bpcs else "Try a bigger image.")
         elif pw_on and not pw:
             problem = "Enter a password or untick encryption."
         elif pw_on and pw != pw2:
             problem = "The passwords don't match."
-        error = problem is not None and problem.startswith(("Too big", "The passwords"))
-        ready = "Ready to hide (2-bit mode for extra room)." if depth and depth > 1 else "Ready to hide."
+        error = problem is not None and problem.startswith(("Too big", "The passwords", "This picture"))
+        if use_bpcs:
+            ready = "Ready to hide with BPCS."
+        else:
+            ready = "Ready to hide (2-bit mode for extra room)." if depth and depth > 1 else "Ready to hide."
         self.hide_hint.configure(text=problem or ready,
                                  fg=T.TEXT_ERROR if error else T.TEXT_MUTED)
         self.hide_button.set_enabled(problem is None and self._busy == 0)
@@ -727,6 +778,7 @@ class App:
         if not path:
             return
         password = self.password.get() if self.use_password.get() else None
+        method = self.method.get()
         what = "message" if isinstance(secret, core.TextSecret) else f"file “{secret.name}”"
         self._set_busy(True, "Hiding data…")
 
@@ -751,7 +803,8 @@ class App:
             else:
                 self._error("Hiding failed.", exc)
 
-        self.worker.run(lambda: core.encode(cover.source, secret, path, password), done, failed)
+        self.worker.run(lambda: core.encode(cover.source, secret, path, password, method=method),
+                        done, failed)
 
     # ============================================================ reveal page
     def browse_reveal(self) -> None:
@@ -780,10 +833,7 @@ class App:
             self.reveal_zone.set_image(loaded.thumb)
             self.reveal_name.configure(text=ellipsize(loaded.name, T.FONT_BOLD, T.px(250)))
             self.reveal_details.configure(text=f"{loaded.width:,} × {loaded.height:,} pixels · {loaded.fmt}")
-            if loaded.has_data:
-                self.reveal_note.configure(text="Contains hidden data.", fg=T.TEXT_OK)
-            else:
-                self.reveal_note.configure(text="No hidden data detected.", fg=T.TEXT_MUTED)
+            self._show_reveal_note(loaded)
             self.reveal(auto=True)
 
         def failed(exc: BaseException) -> None:
@@ -791,6 +841,13 @@ class App:
             self._error("Could not open the image.", exc)
 
         self.worker.run(lambda: load_image(source, T.px(84) * 2, for_encoding=False), done, failed)
+
+    def _show_reveal_note(self, loaded: LoadedImage) -> None:
+        if loaded.data_method:
+            self.reveal_note.configure(
+                text=f"Contains hidden data ({METHOD_NAMES[loaded.data_method]}).", fg=T.TEXT_OK)
+        else:
+            self.reveal_note.configure(text="No hidden data detected.", fg=T.TEXT_MUTED)
 
     def reveal(self, auto: bool = False) -> None:
         loaded = self.inspected
@@ -801,7 +858,8 @@ class App:
         if self._busy and not auto:
             return
         password = self.reveal_password.get() or None
-        self._set_busy(True, "Looking for hidden data…")
+        method = self.method.get()
+        self._set_busy(True, f"Looking for {METHOD_NAMES[method]} data…")
 
         def done(revealed: core.Revealed) -> None:
             self._set_busy(False)
@@ -820,9 +878,14 @@ class App:
                 self.reveal_pw_entry.entry.select_range(0, "end")
                 self.reveal_pw_entry.focus_set()
             elif isinstance(exc, NoHiddenDataError):
-                self.status.set("No hidden data found.")
-                self._legacy_candidate = exc.candidate
-                self._show_reveal_state("none")
+                other = loaded.data_method
+                if other and other != method:
+                    self.status.set(f"This picture was hidden with {METHOD_NAMES[other]}.")
+                    self._show_reveal_state("other")
+                else:
+                    self.status.set(f"No {METHOD_NAMES[method]} data found.")
+                    self._legacy_candidate = exc.candidate
+                    self._show_reveal_state("none")
             elif isinstance(exc, CorruptDataError):
                 self.status.set("The hidden data is damaged.")
                 self._show_reveal_state("corrupt", str(exc))
@@ -830,16 +893,22 @@ class App:
                 self._show_reveal_state("empty")
                 self._error("Reading the image failed.", exc)
 
-        self.worker.run(lambda: core.decode(loaded.source, password), done, failed)
+        self.worker.run(lambda: core.decode(loaded.source, password, method=method), done, failed)
 
     def _show_reveal_state(self, state: str, extra: str = "") -> None:
+        method = METHOD_NAMES[self.method.get()]
+        other = self.inspected.data_method if self.inspected else None
+        other_name = METHOD_NAMES.get(other or "", "")
         icon_kind, text = {
             "empty": (None, "Open a picture to see what's hidden inside it.\n"
                             "You can also drop one onto this page or paste it with Ctrl+V."),
             "locked": ("question", "This picture holds password-protected content.\n"
                                    "Type the password above and click Reveal."),
             "wrong": ("error", "That password is incorrect. Check it and try again."),
-            "none": ("info", "No hidden data was found in this picture."),
+            "none": ("info", f"No {method} hidden data was found in this picture."),
+            "other": ("info", f"This picture holds data hidden with {other_name}, "
+                              f"but the method is set to {method}.\n"
+                              f"Switch to {other_name} to reveal it."),
             "corrupt": ("warning", extra),
         }[state]
         self.revealed = None
@@ -855,6 +924,11 @@ class App:
             self.extract_anyway.grid(row=1, column=1, sticky="w", pady=(T.px(8), 0))
         else:
             self.extract_anyway.grid_remove()
+        if state == "other":
+            self.switch_method_button.set_text(f"Use {other_name}")
+            self.switch_method_button.grid(row=1, column=1, sticky="w", pady=(T.px(8), 0))
+        else:
+            self.switch_method_button.grid_remove()
         self.result_text.configure(text=text, fg=T.TEXT_MUTED if state == "empty" else T.TEXT)
         self.result_message.tkraise()
 
@@ -864,7 +938,7 @@ class App:
 
     def _show_revealed(self, revealed: core.Revealed) -> None:
         self.revealed = revealed
-        traits = []
+        traits = [METHOD_NAMES.get(revealed.method, revealed.method)]
         if revealed.encrypted:
             traits.append("encrypted")
         traits.append("old format, unverified" if revealed.legacy else "verified")
@@ -930,7 +1004,8 @@ class App:
             self.root, f"About {APP_NAME}",
             f"{APP_NAME} {__version__}\n\n"
             "Hides a message or a file in the lowest bit of each pixel's red, green and blue "
-            "values. The change is invisible to the eye.\n\n"
+            "values (LSB), or in the picture's noisy 8×8 bit-plane blocks (BPCS). The change "
+            "is invisible to the eye.\n\n"
             "Hidden content is compressed, checked for damage, and can be locked with a "
             "password (AES-256-GCM).",
             icon=icons.app_icon(T.px(32)),

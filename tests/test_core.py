@@ -268,3 +268,120 @@ def test_header_crc_is_checked_before_password(cover, tmp_path):
     _, _, length, crc = core.HEADER.unpack(container[: core.HEADER.size])
     assert crc == zlib.crc32(container[core.HEADER.size:])
     assert core.decode(result.path, "pw").text == "x"
+
+
+# ---------------------------------------------------------------------- BPCS
+
+@pytest.fixture
+def photo_cover(tmp_path):
+    """Half smooth gradient, half texture: BPCS should only use the texture."""
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[0:128, 0:192]
+    arr = np.stack([x * 255 // 192, y * 255 // 128, (x + y) % 256], -1).astype(np.int64)
+    arr[:, 96:] += rng.integers(-40, 40, (128, 96, 3))
+    path = tmp_path / "photo.png"
+    Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(path)
+    return path
+
+
+@pytest.mark.parametrize("secret", [
+    core.TextSecret("Hello, BPCS! " * 20),
+    core.TextSecret(""),
+    core.FileSecret("data.bin", os.urandom(3000)),
+    core.FileSecret("zeros.bin", bytes(3000)),  # simple blocks: must be conjugated
+])
+def test_bpcs_roundtrip(photo_cover, tmp_path, secret):
+    result = core.encode(photo_cover, secret, tmp_path / "out.png", method="bpcs")
+    assert result.method == "bpcs"
+    revealed = core.decode(result.path)  # method is detected, not passed
+    if isinstance(secret, core.TextSecret):
+        assert revealed.is_text and revealed.text == secret.text
+    else:
+        assert (revealed.name, revealed.data) == (secret.name, secret.data)
+
+
+def test_bpcs_with_password(photo_cover, tmp_path):
+    result = core.encode(photo_cover, core.TextSecret("top secret"), tmp_path / "out.png",
+                         "pw", method="bpcs")
+    with pytest.raises(PasswordRequiredError):
+        core.decode(result.path)
+    with pytest.raises(WrongPasswordError):
+        core.decode(result.path, "nope")
+    assert core.decode(result.path, "pw").text == "top secret"
+
+
+def test_bpcs_changes_only_the_low_bit_planes(photo_cover, tmp_path):
+    result = core.encode(photo_cover, core.FileSecret("r.bin", os.urandom(2000)),
+                         tmp_path / "out.png", method="bpcs")
+    before = np.asarray(Image.open(photo_cover), dtype=np.int16)
+    after = np.asarray(Image.open(result.path), dtype=np.int16)
+    assert np.abs(after - before).max() < 1 << core.bpcs.PLANES
+
+
+def test_bpcs_skips_flat_pictures(tmp_path):
+    flat = Image.new("RGB", (64, 64), (120, 130, 140))
+    assert core.bpcs_capacity(flat) == 0
+    with pytest.raises(CapacityError):
+        core.encode(flat, core.TextSecret("x"), tmp_path / "out.png", method="bpcs")
+
+
+def test_bpcs_capacity_error(photo_cover, tmp_path):
+    room = core.bpcs_capacity(photo_cover)
+    with pytest.raises(CapacityError):
+        core.encode(photo_cover, core.FileSecret("big.bin", os.urandom(room)),
+                    tmp_path / "out.png", method="bpcs")
+
+
+def test_bpcs_detected_and_lsb_unaffected(photo_cover, cover, tmp_path):
+    bpcs_out = core.encode(photo_cover, core.TextSecret("a"), tmp_path / "b.png", method="bpcs").path
+    lsb_out = core.encode(cover, core.TextSecret("b"), tmp_path / "l.png").path
+    assert core.has_container(bpcs_out) and core.has_container(lsb_out)
+    assert not core.has_container(photo_cover)
+    assert core.decode(lsb_out).text == "b"
+
+
+def test_unknown_method(cover, tmp_path):
+    with pytest.raises(ValueError):
+        core.encode(cover, core.TextSecret("x"), tmp_path / "out.png", method="dct")
+
+
+def test_bpcs_conjugation_restores_complexity():
+    from lsb_stego import bpcs
+
+    blocks = bpcs._data_blocks(bytes(64))
+    assert (bpcs.complexity(blocks) >= bpcs.THRESHOLD).all()
+    assert (blocks[:, 0, 0] == 1).all()  # all-zero data is simple, so every block is flagged
+
+
+def test_bpcs_over_old_lsb_data_reads_the_new_secret(tmp_path):
+    # Flat left half: BPCS leaves it alone, so the old LSB header there must be wiped.
+    arr = np.full((128, 192, 3), 120, dtype=np.int64)
+    arr[:, 96:] += np.random.default_rng(3).integers(-40, 40, (128, 96, 3))
+    src = tmp_path / "c.png"
+    Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).save(src)
+    old = core.encode(src, core.TextSecret("old LSB"), tmp_path / "a.png").path
+    new = core.encode(old, core.TextSecret("new BPCS"), tmp_path / "b.png", method="bpcs").path
+    assert core.decode(new).text == "new BPCS"
+
+
+def test_lsb_over_old_bpcs_data_reads_the_new_secret(photo_cover, tmp_path):
+    old = core.encode(photo_cover, core.TextSecret("old BPCS"), tmp_path / "a.png", method="bpcs").path
+    new = core.encode(old, core.TextSecret("new LSB"), tmp_path / "b.png").path
+    assert core.decode(new).text == "new LSB"
+
+
+def test_decode_with_a_chosen_method(photo_cover, cover, tmp_path):
+    bpcs_out = core.encode(photo_cover, core.TextSecret("b"), tmp_path / "b.png", method="bpcs").path
+    lsb_out = core.encode(cover, core.TextSecret("l"), tmp_path / "l.png").path
+    assert core.detect_method(bpcs_out) == "bpcs" and core.detect_method(lsb_out) == "lsb"
+    assert core.detect_method(photo_cover) is None
+
+    assert core.decode(bpcs_out, method="bpcs").method == "bpcs"
+    assert core.decode(lsb_out, method="lsb").method == "lsb"
+    assert core.decode(bpcs_out).method == "bpcs"  # auto-detect still works
+    with pytest.raises(NoHiddenDataError):
+        core.decode(lsb_out, method="bpcs")
+    with pytest.raises(NoHiddenDataError):
+        core.decode(bpcs_out, method="lsb")
+    with pytest.raises(ValueError):
+        core.decode(lsb_out, method="dct")

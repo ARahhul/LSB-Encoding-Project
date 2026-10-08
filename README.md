@@ -84,6 +84,28 @@ videos, are detected from a sample and stored as they are rather than being zipp
 * **Backward compatible:** pictures made with the original `encode.py` (red channel only,
   ending in four zero bytes) still decode. They're labelled *old format, unverified*.
 
+### BPCS mode
+
+Use the **Method: LSB / BPCS** switch at the top of the app (or answer `B` in `lsb-encode`)
+to hide and reveal with **Bit-Plane Complexity Segmentation** instead. The switch applies to
+both tabs. LSB changes the lowest bit of every channel.
+BPCS changes whole 8×8 blocks, and only where the picture already looks like noise:
+
+1. Each R, G and B value is converted to Gray code, and each of its lowest 4 bit-planes is cut
+   into 8×8 blocks.
+2. A block's *complexity* is its number of black/white borders out of 112. Blocks at 0.3 or
+   above count as noise and are replaced with 63 secret bits each.
+3. A secret block that is too simple is *conjugated* (XORed with a checkerboard) so it still
+   looks like noise, and a flag bit records it so it can be undone.
+
+Smooth areas such as sky are never touched, and no channel changes by more than 15 levels.
+How much fits depends on the picture: busy photos can hold more than LSB, while flat graphics
+and screenshots may hold nothing. The cover note shows both figures. BPCS uses the same
+header (with magic `BPC\x01`), compression, password protection and integrity check.
+**Reveal** reads with the selected method. If the picture was hidden with the other one, it
+says so and offers a one-click *Use BPCS* / *Use LSB* button. `lsb-decode` detects the method
+by itself.
+
 ## Fixed from the original scripts
 
 * `requirements.txt` held a shell command instead of a package list. It's replaced by Poetry.
@@ -127,7 +149,8 @@ Start.wav* (the XP click) is used when available.
 
 ```
 lsb_stego/
-  core.py         engine: container format, embed/extract, legacy reader
+  core.py         engine: container format, LSB embed/extract, legacy reader
+  bpcs.py         BPCS engine: bit-plane blocks, complexity, conjugation
   crypto.py       scrypt + AES-256-GCM
   cli.py          interactive encode/decode
   gui/

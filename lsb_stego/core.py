@@ -18,6 +18,10 @@ by at most 3/255.
 All integers are big-endian. The CRC covers ``blob`` as stored, so damage is
 reported as corruption rather than as a wrong password.
 
+BPCS mode (``method="bpcs"``, see :mod:`bpcs`) stores the same header and
+blob, with magic ``BPC\\x01`` and no depth bits, inside the picture's noisy
+8x8 bit-plane blocks instead. :func:`decode` tells the two apart by magic.
+
 Images written by the original ``encode.py`` (red channel only, terminated by
 four NUL bytes) are still readable; see :func:`_decode_legacy`.
 """
@@ -34,7 +38,7 @@ from typing import Union
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import crypto
+from . import bpcs, crypto
 from .errors import (
     CapacityError,
     CorruptDataError,
@@ -44,6 +48,8 @@ from .errors import (
 )
 
 MAGIC = b"LSB\x02"
+MAGIC_BPCS = b"BPC\x01"
+METHODS = ("lsb", "bpcs")
 HEADER = struct.Struct(">4sBII")
 _INNER = struct.Struct(">BH")
 
@@ -90,6 +96,7 @@ class Revealed:
     encrypted: bool = False
     compressed: bool = False
     legacy: bool = False      # written by the original encode.py: no integrity check
+    method: str = "lsb"       # "lsb" or "bpcs"
 
     @property
     def is_text(self) -> bool:
@@ -106,7 +113,8 @@ class EncodeResult:
     used: int          # bytes written, header included
     capacity: int      # bytes the image could hold at ``depth``
     renamed: bool      # the requested extension was replaced with .png
-    depth: int = 1     # bits per channel used for the payload
+    depth: int = 1     # bits per channel used for the payload (LSB only)
+    method: str = "lsb"
 
 
 # --------------------------------------------------------------------- images
@@ -150,6 +158,11 @@ def capacity(source: ImageSource, depth: int = MAX_DEPTH) -> int:
         with Image.open(source) as img:
             width, height = img.size
     return capacity_for_size(width, height, depth)
+
+
+def bpcs_capacity(source: ImageSource) -> int:
+    """Bytes (header included) BPCS can hide. Depends on the picture's content."""
+    return bpcs.capacity(np.asarray(open_image(source, for_encoding=True), dtype=np.uint8))
 
 
 def depth_needed(size: int, width: int, height: int, max_depth: int = MAX_DEPTH) -> int | None:
@@ -197,6 +210,10 @@ def _header(flags: int, blob: bytes, depth: int) -> bytes:
     return HEADER.pack(MAGIC, flags | ((depth - 1) << DEPTH_SHIFT), len(blob), zlib.crc32(blob))
 
 
+def _bpcs_header(flags: int, blob: bytes) -> bytes:
+    return HEADER.pack(MAGIC_BPCS, flags, len(blob), zlib.crc32(blob))
+
+
 def build_container(secret: Secret, password: str | None = None, depth: int = 1) -> bytes:
     blob, flags = _blob(secret, password)
     return _header(flags, blob, depth) + blob
@@ -208,7 +225,7 @@ def container_size(secret: Secret, password: str | None = None) -> int:
     return HEADER.size + len(blob) + (crypto.OVERHEAD if password else 0)
 
 
-def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool) -> Revealed:
+def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool, method: str = "lsb") -> Revealed:
     if len(inner) < _INNER.size:
         raise CorruptDataError("The hidden content is truncated.")
     kind, name_len = _INNER.unpack_from(inner)
@@ -222,6 +239,7 @@ def _parse_inner(inner: bytes, *, encrypted: bool, compressed: bool) -> Revealed
         name=name,
         encrypted=encrypted,
         compressed=compressed,
+        method=method,
     )
 
 
@@ -274,25 +292,44 @@ def _read(carrier: np.ndarray, start: int, count: int, depth: int) -> bytes:
 # ------------------------------------------------------------------- public
 
 def encode(cover: ImageSource, secret: Secret, out_path: str | os.PathLike,
-           password: str | None = None, *, max_depth: int = MAX_DEPTH) -> EncodeResult:
+           password: str | None = None, *, max_depth: int = MAX_DEPTH,
+           method: str = "lsb") -> EncodeResult:
     """Hide ``secret`` in ``cover`` and write a lossless PNG to ``out_path``.
 
-    Uses 1 bit per channel when the secret fits and up to ``max_depth`` bits
-    when it doesn't. Any extension other than ``.png`` is replaced, because
-    lossy formats such as JPEG would destroy the hidden bits.
+    ``method`` is ``"lsb"`` (default) or ``"bpcs"``. LSB uses 1 bit per
+    channel when the secret fits and up to ``max_depth`` bits when it
+    doesn't. BPCS hides in the picture's noisy areas only; see :mod:`bpcs`.
+    Any extension other than ``.png`` is replaced, because lossy formats
+    such as JPEG would destroy the hidden bits.
     """
+    if method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
     img = open_image(cover, for_encoding=True)
     blob, flags = _blob(secret, password)
     size = HEADER.size + len(blob)
-    depth = depth_needed(size, *img.size, max_depth=max_depth)
-    if depth is None:
-        raise CapacityError(size, capacity_for_size(*img.size, max_depth))
-
     arr = np.array(img, dtype=np.uint8)
-    samples = arr[..., :3].reshape(-1)
-    _write(samples, 0, _header(flags, blob, depth), 1)
-    _write(samples, _HEADER_SAMPLES, blob, depth)
-    arr[..., :3] = samples.reshape(arr.shape[0], arr.shape[1], 3)
+
+    if method == "bpcs":
+        # BPCS only rewrites noisy blocks, so an earlier LSB header in a smooth
+        # area would survive and be read first. Break its magic before BPCS
+        # picks its blocks (so the change can't shift them).
+        samples = arr[..., :3].reshape(-1)
+        if samples.size >= _HEADER_SAMPLES and _read(samples, 0, len(MAGIC), 1) == MAGIC:
+            arr[0, 0, 0] ^= 1
+        room = bpcs.capacity(arr)
+        if size > room:
+            raise CapacityError(size, room)
+        bpcs.embed(arr, _bpcs_header(flags, blob) + blob)
+        depth = 1
+    else:
+        depth = depth_needed(size, *img.size, max_depth=max_depth)
+        if depth is None:
+            raise CapacityError(size, capacity_for_size(*img.size, max_depth))
+        samples = arr[..., :3].reshape(-1)
+        _write(samples, 0, _header(flags, blob, depth), 1)
+        _write(samples, _HEADER_SAMPLES, blob, depth)
+        arr[..., :3] = samples.reshape(arr.shape[0], arr.shape[1], 3)
+        room = capacity_for_size(*img.size, depth)
 
     out = Path(out_path)
     renamed = out.suffix.lower() != ".png"
@@ -300,47 +337,89 @@ def encode(cover: ImageSource, secret: Secret, out_path: str | os.PathLike,
         out = out.with_suffix(".png")
     out.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(out, format="PNG", compress_level=PNG_LEVEL)
-    return EncodeResult(out, size, capacity_for_size(*img.size, depth), renamed, depth)
+    return EncodeResult(out, size, room, renamed, depth, method)
+
+
+def _bpcs_header_of(img: Image.Image) -> tuple[np.ndarray, tuple] | None:
+    """The pixel array and unpacked BPCS header, if the picture has one."""
+    arr = np.asarray(img, dtype=np.uint8)
+    try:
+        header = HEADER.unpack(bpcs.extract(arr, HEADER.size))
+    except ValueError:
+        return None
+    return (arr, header) if header[0] == MAGIC_BPCS else None
+
+
+def detect_method(source: ImageSource) -> str | None:
+    """``"lsb"`` or ``"bpcs"`` for a picture holding a container, else None."""
+    img = open_image(source)
+    carrier = _carrier(img)
+    if carrier.size >= _HEADER_SAMPLES and _read(carrier, 0, len(MAGIC), 1) == MAGIC:
+        return "lsb"
+    return "bpcs" if _bpcs_header_of(img) is not None else None
 
 
 def has_container(source: ImageSource) -> bool:
-    carrier = _carrier(open_image(source))
-    if carrier.size < _HEADER_SAMPLES:
-        return False
-    return _read(carrier, 0, len(MAGIC), 1) == MAGIC
+    return detect_method(source) is not None
 
 
-def decode(source: ImageSource, password: str | None = None) -> Revealed:
-    """Extract whatever :func:`encode` (or the original ``encode.py``) hid."""
+def _open_blob(flags: int, blob: bytes, crc: int, password: str | None,
+               method: str) -> Revealed:
+    """Check, decrypt and decompress a stored blob (shared by LSB and BPCS)."""
+    if zlib.crc32(blob) != crc:
+        raise CorruptDataError(
+            "The hidden content is damaged. The image was probably edited, "
+            "resized or re-saved in a lossy format after the data was hidden."
+        )
+    encrypted = bool(flags & FLAG_ENCRYPTED)
+    compressed = bool(flags & FLAG_COMPRESSED)
+    if encrypted:
+        if not password:
+            raise PasswordRequiredError("This content is protected by a password.")
+        blob = crypto.decrypt(blob, password, aad=MAGIC)
+    if compressed:
+        try:
+            inflater = zlib.decompressobj()
+            blob = inflater.decompress(blob, MAX_DECOMPRESSED)
+        except zlib.error as exc:
+            raise CorruptDataError("The hidden content could not be decompressed.") from exc
+    return _parse_inner(blob, encrypted=encrypted, compressed=compressed, method=method)
+
+
+def decode(source: ImageSource, password: str | None = None, *,
+           method: str | None = None) -> Revealed:
+    """Extract whatever :func:`encode` (or the original ``encode.py``) hid.
+
+    ``method`` limits the search to ``"lsb"`` (which includes the original
+    format) or ``"bpcs"``; by default both are tried and told apart by magic.
+    """
+    if method is not None and method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
     img = open_image(source)
     carrier = _carrier(img)
 
-    if carrier.size >= _HEADER_SAMPLES:
+    if method != "bpcs" and carrier.size >= _HEADER_SAMPLES:
         magic, flags, length, crc = HEADER.unpack(_read(carrier, 0, HEADER.size, 1))
         if magic == MAGIC:
             depth = ((flags & DEPTH_MASK) >> DEPTH_SHIFT) + 1
             if length > capacity_for_size(*img.size, depth) - HEADER.size:
                 raise CorruptDataError("The hidden content's length is larger than the image.")
             blob = _read(carrier, _HEADER_SAMPLES, length, depth)
-            if zlib.crc32(blob) != crc:
-                raise CorruptDataError(
-                    "The hidden content is damaged. The image was probably edited, "
-                    "resized or re-saved in a lossy format after the data was hidden."
-                )
-            encrypted = bool(flags & FLAG_ENCRYPTED)
-            compressed = bool(flags & FLAG_COMPRESSED)
-            if encrypted:
-                if not password:
-                    raise PasswordRequiredError("This content is protected by a password.")
-                blob = crypto.decrypt(blob, password, aad=MAGIC)
-            if compressed:
-                try:
-                    inflater = zlib.decompressobj()
-                    blob = inflater.decompress(blob, MAX_DECOMPRESSED)
-                except zlib.error as exc:
-                    raise CorruptDataError("The hidden content could not be decompressed.") from exc
-            return _parse_inner(blob, encrypted=encrypted, compressed=compressed)
+            return _open_blob(flags, blob, crc, password, "lsb")
 
+    found = _bpcs_header_of(img) if method != "lsb" else None
+    if found is not None:
+        arr, (_magic, flags, length, crc) = found
+        if length > carrier.size // 2:  # BPCS can never use more than half the bits
+            raise CorruptDataError("The hidden content's length is larger than the image.")
+        try:
+            blob = bpcs.extract(arr, HEADER.size + length)[HEADER.size:]
+        except ValueError as exc:
+            raise CorruptDataError("The hidden content runs past the end of the image.") from exc
+        return _open_blob(flags, blob, crc, password, "bpcs")
+
+    if method == "bpcs":
+        raise NoHiddenDataError()
     return _decode_legacy(img)
 
 

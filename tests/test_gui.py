@@ -204,6 +204,12 @@ def test_data_map_window(tk_root, tmp_path, method):
     window = datamap.DataMapWindow(tk_root, "h.png", np.asarray(img), core.locate(img))
     try:
         assert window.used[window.y, window.x]  # starts on the first data pixel
+        # Nothing may be drawn over the picture's edge rows, where LSB data starts,
+        # and a few hidden bytes must be called out, not left as a speck.
+        assert int(window.map.cget("highlightthickness")) == 0
+        texts = [window.map.itemcget(i, "text") for i in window.map.find_all()
+                 if window.map.type(i) == "text"]
+        assert "Hidden data is here" in texts
         assert "Red bits hold hidden data" in window.pixel_note.cget("text")
         window.move(63, 63)
         assert (window.x, window.y) == (63, 63)
@@ -218,9 +224,9 @@ def test_data_map_fit_keeps_small_data_visible():
 
     used = np.zeros((1000, 1500), dtype=bool)
     used[0, 0] = True  # one pixel in a big picture
-    image, scale = datamap._fit(np.zeros((1000, 1500, 3), np.uint8), used, 300, 200)
+    image, scale, shown = datamap._fit(np.zeros((1000, 1500, 3), np.uint8), used, 300, 200)
     assert image.size == (300, 200) and scale == pytest.approx(0.2)
-    assert image.getpixel((0, 0)) == datamap.HIGHLIGHT
+    assert image.getpixel((0, 0)) == datamap.HIGHLIGHT and shown[0, 0] and shown.sum() == 1
 
 
 def test_show_where_button(app_factory, tmp_path, monkeypatch):

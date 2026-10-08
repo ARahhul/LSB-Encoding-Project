@@ -31,8 +31,9 @@ def render(rgb: np.ndarray, used: np.ndarray) -> Image.Image:
     return Image.fromarray(out)
 
 
-def _fit(rgb: np.ndarray, used: np.ndarray, max_w: int, max_h: int) -> tuple[Image.Image, float]:
-    """Map scaled to fit, and display pixels per image pixel.
+def _fit(rgb: np.ndarray, used: np.ndarray, max_w: int,
+         max_h: int) -> tuple[Image.Image, float, np.ndarray]:
+    """Map scaled to fit, display pixels per image pixel, and the display mask.
 
     Shrinking keeps every data pixel visible: a display pixel is red when any
     image pixel under it holds data.
@@ -41,7 +42,8 @@ def _fit(rgb: np.ndarray, used: np.ndarray, max_w: int, max_h: int) -> tuple[Ima
     scale = min(max_w / w, max_h / h)
     if scale >= 1:
         zoom = max(1, min(int(scale), 16))
-        return render(rgb, used).resize((w * zoom, h * zoom), Image.Resampling.NEAREST), float(zoom)
+        shown = used.repeat(zoom, axis=0).repeat(zoom, axis=1)
+        return render(rgb, used).resize((w * zoom, h * zoom), Image.Resampling.NEAREST), float(zoom), shown
     tw, th = max(1, round(w * scale)), max(1, round(h * scale))
     rows = (np.arange(th) * h) // th
     cols = (np.arange(tw) * w) // tw
@@ -49,7 +51,7 @@ def _fit(rgb: np.ndarray, used: np.ndarray, max_w: int, max_h: int) -> tuple[Ima
                                      cols, axis=1).astype(bool)
     small = np.asarray(Image.fromarray(np.ascontiguousarray(rgb[..., :3])).resize(
         (tw, th), Image.Resampling.BOX))
-    return render(small, small_used), tw / w
+    return render(small, small_used), tw / w, small_used
 
 
 class DataMapWindow(XPDialog):
@@ -68,13 +70,17 @@ class DataMapWindow(XPDialog):
         # Map
         map_box = XPGroupBox(top, "Map")
         map_box.grid(row=0, column=0, sticky="nsew")
-        image, self.scale = _fit(rgb, self.used, T.px(400), T.px(300))
+        image, self.scale, shown = _fit(rgb, self.used, T.px(400), T.px(300))
         self._map_photo = photo(image, cache=False)
-        self.map = tk.Canvas(map_box.body, width=image.width, height=image.height,
-                             highlightthickness=1, highlightbackground=T.FIELD_BORDER, bd=0,
-                             bg=T.WHITE, cursor="crosshair")
+        # The border goes around the canvas, not over the picture's edge rows,
+        # where LSB data starts.
+        frame = tk.Frame(map_box.body, bg=T.FIELD_BORDER, padx=1, pady=1)
+        frame.pack()
+        self.map = tk.Canvas(frame, width=image.width, height=image.height, highlightthickness=0,
+                             bd=0, bg=T.WHITE, cursor="crosshair")
         self.map.pack()
         self.map.create_image(0, 0, image=self._map_photo, anchor="nw")
+        self._draw_callout(shown)
         self.map.bind("<Button-1>", self._on_map_click)
         self.map.bind("<B1-Motion>", self._on_map_click)
         legend = tk.Frame(map_box.body, bg=map_box.body.cget("bg"))
@@ -89,8 +95,9 @@ class DataMapWindow(XPDialog):
         zoom_box.pack(fill="x")
         self.cell = T.px(10)
         size = MAGNIFIER * self.cell
-        self.zoom = tk.Canvas(zoom_box.body, width=size, height=size, highlightthickness=1,
-                              highlightbackground=T.FIELD_BORDER, bd=0, bg=T.WHITE)
+        frame = tk.Frame(zoom_box.body, bg=T.FIELD_BORDER, padx=1, pady=1)
+        frame.pack()
+        self.zoom = tk.Canvas(frame, width=size, height=size, highlightthickness=0, bd=0, bg=T.WHITE)
         self.zoom.pack()
         self.zoom.bind("<Button-1>", self._on_zoom_click)
 
@@ -173,14 +180,36 @@ class DataMapWindow(XPDialog):
         self.select(self.x - half + event.x // self.cell, self.y - half + event.y // self.cell)
 
     # ------------------------------------------------------------ drawing
+    def _draw_callout(self, shown: np.ndarray) -> None:
+        """Box and label the data when it's too small to spot on the map."""
+        rows, cols = np.flatnonzero(shown.any(axis=1)), np.flatnonzero(shown.any(axis=0))
+        if not rows.size:
+            return
+        mh, mw = shown.shape
+        x0, x1, y0, y1 = cols[0], cols[-1] + 1, rows[0], rows[-1] + 1
+        if (x1 - x0) * (y1 - y0) > 0.05 * mw * mh and min(x1 - x0, y1 - y0) >= T.px(6):
+            return
+        pad = T.px(4)
+        bx0, by0 = max(1, x0 - pad), max(1, y0 - pad)
+        bx1, by1 = min(mw - 1, x1 + pad), min(mh - 1, y1 + pad)
+        self.map.create_rectangle(bx0, by0, bx1, by1, outline=HIGHLIGHT_HEX, width=2)
+        text = "Hidden data is here"
+        tw, th = T.FONT.measure(text) + T.px(8), T.FONT.metrics("linespace") + T.px(4)
+        tx = min(max(1, bx0), mw - tw - 1)
+        ty = by1 + T.px(3) if by1 + T.px(3) + th < mh else by0 - T.px(3) - th
+        self.map.create_rectangle(tx, ty, tx + tw, ty + th, fill=HIGHLIGHT_HEX, outline="")
+        self.map.create_text(tx + T.px(4), ty + th // 2, text=text, anchor="w", fill=T.WHITE,
+                             font=T.FONT_BOLD)
+
     def _draw_marker(self) -> None:
         self.map.delete("marker")
         s = self.scale
         x0, y0 = self.x * s, self.y * s
         x1, y1 = x0 + max(s, 1), y0 + max(s, 1)
-        r = T.px(5)
-        self.map.create_rectangle(x0 - r, y0 - r, x1 + r, y1 + r, outline="#000000", width=2, tags="marker")
-        self.map.create_rectangle(x0 - r - 2, y0 - r - 2, x1 + r + 2, y1 + r + 2, outline="#FFFFFF",
+        r = T.px(3)
+        # Thin and hollow, so it doesn't hide the red data pixels under it.
+        self.map.create_rectangle(x0 - r, y0 - r, x1 + r, y1 + r, outline="#000000", width=1, tags="marker")
+        self.map.create_rectangle(x0 - r - 1, y0 - r - 1, x1 + r + 1, y1 + r + 1, outline="#FFFFFF",
                                   width=1, tags="marker")
 
     def _draw_zoom(self) -> None:

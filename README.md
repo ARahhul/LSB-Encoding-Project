@@ -124,6 +124,33 @@ data is isn't encrypted.
 Click the map or the magnifier to pick a pixel, or move with the arrow keys (Shift+arrow moves 8
 pixels). **Save Map…** saves the full-size map as a PNG.
 
+### Before and after
+
+To show what changed, the window needs the original picture, because the colours from before
+hiding aren't stored anywhere. There are two ways to give it:
+
+* After **Hide Data…**, click **Show Changes** in the "now hidden" message. The app still has
+  the original, so it compares straight away.
+* In **Show Where…**, click **Compare with Original…** and choose the cover picture. The app
+  checks that it really is the original: same size, and no differences outside the hidden data.
+
+The selected pixel is then shown as a before → after table:
+
+| | Before | | After | Change | Hidden bit = which bit of the message |
+| --- | --- | --- | --- | --- | --- |
+| R | `1001111`**`0`** 158 | → | `1001111`**`0`** 158 | 0 | 0 = bit 7 of name length |
+| B | `1011010`**`1`** 181 | → | `1011010`**`0`** 180 | −1 | 0 = bit 1 of letter 'M' (**0**1001101) |
+
+* **Red** bits changed. **Amber** bits hold hidden data but already had the right value, so
+  they didn't need to change. With LSB about half the hidden bits are amber, which is why no
+  value moves by more than 1.
+* The last column says what each hidden bit is: part of the marker, the length, the CRC, or a
+  letter of the message, with that letter's 8 bits and the one stored here picked out. With a
+  password the bytes are encrypted, so it says *encrypted byte* instead.
+* For BPCS the bits are shown in Gray code, where BPCS works, with the colour values beside
+  them. A line under the table explains the block, its bit-plane, and whether it was conjugated
+  (flipped in a checkerboard pattern so it still looks like noise).
+
 ## Fixed from the original scripts
 
 * `requirements.txt` held a shell command instead of a package list. It's replaced by Poetry.

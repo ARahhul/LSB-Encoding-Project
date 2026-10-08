@@ -210,13 +210,79 @@ def test_data_map_window(tk_root, tmp_path, method):
         texts = [window.map.itemcget(i, "text") for i in window.map.find_all()
                  if window.map.type(i) == "text"]
         assert "Hidden data is here" in texts
-        assert "Red bits hold hidden data" in window.pixel_note.cget("text")
+        assert window.how.cget("text").startswith("LSB" if method == "lsb" else "BPCS")
         window.move(63, 63)
         assert (window.x, window.y) == (63, 63)
         window.move(5, 5)  # clamped to the picture
         assert (window.x, window.y) == (63, 63)
     finally:
         window.destroy()
+
+
+def _table_texts(window):
+    return [window.table.itemcget(i, "text") for i in window.table.find_all()
+            if window.table.type(i) == "text"]
+
+
+def test_data_map_before_and_after(tk_root, tmp_path):
+    from lsb_stego.gui import datamap, theme
+
+    theme.init(tk_root)
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("Meet"), tmp_path / "h.png").path
+    before = np.asarray(core.open_image(src, for_encoding=True))
+    after = np.asarray(core.open_image(hidden))
+    window = datamap.DataMapWindow(tk_root, "h.png", after, core.locate(hidden), original=before)
+    try:
+        assert window.changed[window.y, window.x]  # starts on the first changed pixel
+        texts = _table_texts(window)
+        assert "Before" in texts and "After" in texts
+        assert any(t in ("+1", "-1") for t in texts)  # LSB moves a value by one
+        assert any("marker 'L'" in t for t in texts)  # the first pixel holds the "LSB" marker
+        assert "actually changed" in window.summary.cget("text")
+        assert not window.compare_button.enabled
+        # Walk to a pixel holding message letters
+        data = core.locate(hidden)
+        letters = [(x, y) for y in range(8) for x in range(64)
+                   if any("letter 'M'" in data.describe_byte(b.byte) for b in data.hidden_bits(x, y))]
+        window.select(*letters[0])
+        assert any("of letter 'M'" in t for t in _table_texts(window))
+    finally:
+        window.destroy()
+
+
+def test_data_map_rejects_wrong_original(tk_root, tmp_path):
+    from lsb_stego.gui import datamap, theme
+
+    theme.init(tk_root)
+    src = _textured(tmp_path / "c.png")
+    hidden = core.encode(src, core.TextSecret("x"), tmp_path / "h.png").path
+    after = np.asarray(core.open_image(hidden))
+    window = datamap.DataMapWindow(tk_root, "h.png", after, core.locate(hidden))
+    try:
+        assert "pixels, but this one" in window.check_original(np.zeros((10, 10, 3), np.uint8))
+        assert "identical" in window.check_original(after.copy())
+        other = np.asarray(core.open_image(_textured(tmp_path / "o.png")))[::-1].copy()
+        assert "doesn't look like the original" in window.check_original(other)
+        before = np.asarray(core.open_image(src, for_encoding=True))
+        assert window.check_original(before) is None
+        assert window.compare_button.enabled
+    finally:
+        window.destroy()
+
+
+def test_show_changes_after_hiding(app_factory, tmp_path, monkeypatch):
+    gui_app, app = app_factory()
+    shown = []
+    monkeypatch.setattr(gui_app.datamap, "show", lambda *args, **kw: shown.append((args, kw)))
+    src = _textured(tmp_path / "c.png")
+    cover = gui_app.load_image(src, 32, for_encoding=True)
+    result = core.encode(src, core.TextSecret("hi"), tmp_path / "h.png", method="bpcs")
+    app.show_changes(cover, result)
+    _wait_idle(app)
+    ((_root, name, after, data), kw), = shown
+    assert name == "h.png" and data.method == "bpcs"
+    assert (kw["original"] != after).any()
 
 
 def test_data_map_fit_keeps_small_data_visible():

@@ -177,19 +177,22 @@ def extract(rgb: np.ndarray, count: int) -> bytes:
     return np.packbits(bits).tobytes()
 
 
-def bit_map(rgb: np.ndarray, count: int) -> tuple[np.ndarray, int]:
-    """Where the first ``count`` hidden bytes are, and how many blocks hold them.
+def bit_map(rgb: np.ndarray, count: int) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray, np.ndarray]]]:
+    """Where the first ``count`` hidden bytes are, and the blocks that hold them.
 
     The map is (height, width, 3) uint8: bit ``k`` of ``map[y, x, c]`` is set
-    when bit-plane ``k`` of that channel's Gray-coded value carries data.
+    when bit-plane ``k`` of that channel's Gray-coded value carries data. The
+    blocks come in embedding order as (plane, channel, block indices,
+    conjugated flags).
     """
     out = np.zeros((rgb.shape[0], rgb.shape[1], 3), dtype=np.uint8)
     gray = _gray_area(rgb)
     h, w = gray.shape[:2]
-    holding = _holding(gray, count)
-    for plane, channel, _blocks, take in holding:
+    order = []
+    for plane, channel, blocks, take in _holding(gray, count):
         used = np.zeros((h // BLOCK) * (w // BLOCK), dtype=bool)
         used[take] = True
         used = used.reshape(h // BLOCK, w // BLOCK).repeat(BLOCK, axis=0).repeat(BLOCK, axis=1)
         out[:h, :w, channel] |= used.astype(np.uint8) << np.uint8(plane)
-    return out, sum(take.size for *_, take in holding)
+        order.append((plane, channel, take, blocks[take, 0, 0] == 1))
+    return out, order

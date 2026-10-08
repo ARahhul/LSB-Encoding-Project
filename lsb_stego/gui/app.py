@@ -797,9 +797,11 @@ class App:
             if password:
                 detail += "\n\nYou'll need the password to reveal it. It cannot be recovered if lost."
             choice = dialogs.message(self.root, APP_NAME, text, kind="info", detail=detail,
-                                     buttons=("Open Folder", "OK"), default=1, cancel="OK")
+                                     buttons=("Show Changes", "Open Folder", "OK"), default=2, cancel="OK")
             if choice == "Open Folder":
                 open_folder(result.path)
+            elif choice == "Show Changes":
+                self.show_changes(cover, result)
 
         def failed(exc: BaseException) -> None:
             self._set_busy(False)
@@ -900,6 +902,26 @@ class App:
                 self._error("Reading the image failed.", exc)
 
         self.worker.run(lambda: core.decode(loaded.source, password, method=method), done, failed)
+
+    def show_changes(self, cover: LoadedImage, result: core.EncodeResult) -> None:
+        """Open the map for a picture just made, comparing it with its cover."""
+        self._set_busy(True, "Comparing with the original…")
+
+        def job():
+            before = np.asarray(core.open_image(cover.source, for_encoding=True), dtype=np.uint8)
+            img = core.open_image(result.path)
+            return before, np.asarray(img, dtype=np.uint8), core.locate(img, method=result.method)
+
+        def done(found) -> None:
+            before, after, data = found
+            self._set_busy(False, f"{int((before[..., :3] != after[..., :3]).any(axis=2).sum()):,} pixels changed.")
+            datamap.show(self.root, result.path.name, after, data, original=before)
+
+        def failed(exc: BaseException) -> None:
+            self._set_busy(False)
+            self._error("Could not compare the pictures.", exc)
+
+        self.worker.run(job, done, failed)
 
     def show_data_map(self) -> None:
         """Open the map of the pixels and bits that hold the hidden data."""

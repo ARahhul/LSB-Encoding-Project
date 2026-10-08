@@ -108,6 +108,26 @@ class Revealed:
 
 
 @dataclass(frozen=True)
+class HiddenBit:
+    """One hidden bit inside one colour value (see :meth:`DataMap.hidden_bits`)."""
+    channel: int               # 0 red, 1 green, 2 blue
+    plane: int                 # bit position in the value, 0 = last bit (Gray-coded for BPCS)
+    index: int | None = None   # position in the hidden stream; None for flag/padding bits
+    kind: str = "data"         # "data", "flag" (BPCS conjugation flag) or "padding"
+    inverted: bool = False     # BPCS: this bit is stored flipped (conjugated block, checkerboard 1)
+    conjugated: bool = False   # BPCS: the whole block was conjugated
+
+    @property
+    def byte(self) -> int:
+        return (self.index or 0) // 8
+
+    @property
+    def bit(self) -> int:
+        """0 = the byte's most significant (leftmost) bit."""
+        return (self.index or 0) % 8
+
+
+@dataclass(frozen=True)
 class DataMap:
     """Which bits of which pixels hold hidden data (see :func:`locate`).
 
@@ -120,10 +140,102 @@ class DataMap:
     used: int             # bytes stored, header included
     depth: int = 1        # LSB: bits per channel for the payload
     blocks: int = 0       # BPCS: 8x8 blocks holding data
+    stream: bytes = b""   # what is stored, in order: header + blob (old format: data + NULs)
+    order: tuple = ()     # BPCS: (plane, channel, block indices, conjugated) in embedding order
 
     @property
     def gray(self) -> bool:
         return self.method == "bpcs"
+
+    def hidden_bits(self, x: int, y: int) -> list[HiddenBit]:
+        """The hidden bits in pixel (x, y), with their place in :attr:`stream`."""
+        h, w = self.bits.shape[:2]
+        found: list[HiddenBit] = []
+        if self.method == "lsb":
+            payload_bits = (self.used - HEADER.size) * 8
+            for c in range(3):
+                s = (y * w + x) * 3 + c
+                if s < _HEADER_SAMPLES:
+                    found.append(HiddenBit(c, 0, s))
+                    continue
+                for j in range(self.depth):
+                    b = (s - _HEADER_SAMPLES) * self.depth + j
+                    if b < payload_bits:
+                        found.append(HiddenBit(c, self.depth - 1 - j, _HEADER_SAMPLES + b))
+        elif self.method == "legacy":
+            s = y * w + x
+            if s < self.used * 8:
+                found.append(HiddenBit(0, 0, s))
+        elif self.method == "bpcs":
+            blocks_across = w // bpcs.BLOCK
+            if x >= blocks_across * bpcs.BLOCK or y >= h // bpcs.BLOCK * bpcs.BLOCK:
+                return found
+            block = (y // bpcs.BLOCK) * blocks_across + x // bpcs.BLOCK
+            row, col = y % bpcs.BLOCK, x % bpcs.BLOCK
+            pos = row * bpcs.BLOCK + col
+            offset = 0
+            for plane, channel, take, conjugated in self.order:
+                i = int(np.searchsorted(take, block))
+                if i < take.size and take[i] == block:
+                    conj = bool(conjugated[i])
+                    if pos == 0:
+                        found.append(HiddenBit(channel, plane, kind="flag", conjugated=conj))
+                    else:
+                        b = (offset + i) * bpcs.DATA_BITS + pos - 1
+                        flipped = conj and bool(bpcs.CHECKERBOARD[row, col])
+                        if b < self.used * 8:
+                            found.append(HiddenBit(channel, plane, b, inverted=flipped, conjugated=conj))
+                        else:
+                            found.append(HiddenBit(channel, plane, kind="padding", inverted=flipped,
+                                                   conjugated=conj))
+                offset += take.size
+        return sorted(found, key=lambda bit: (bit.channel, -bit.plane))
+
+    def describe_byte(self, index: int) -> str:
+        """What byte ``index`` of :attr:`stream` is, in a few words."""
+        def char(b: int) -> str:
+            ch = chr(b)
+            return {" ": "space", "\n": "line break", "\t": "tab"}.get(
+                ch, f"'{ch}'" if ch.isprintable() and b < 128 else f"0x{b:02X}")
+
+        data = self.stream
+        if self.method == "legacy":
+            if index >= self.used - len(LEGACY_TERMINATOR):
+                return "end marker"
+            return f"letter {char(data[index])}" if data[index] < 128 else "file byte"
+        if index < 4:
+            return f"marker {char(data[index])}"
+        if index == 4:
+            return "flags byte"
+        if index < 9:
+            return "length field"
+        if index < HEADER.size:
+            return "CRC-32 check"
+        flags = data[4]
+        k = index - HEADER.size
+        if flags & FLAG_ENCRYPTED:
+            return "encrypted byte"
+        if flags & FLAG_COMPRESSED:
+            return "compressed byte"
+        kind, name_len = _INNER.unpack_from(data, HEADER.size)
+        if k == 0:
+            return "text/file type"
+        if k < _INNER.size:
+            return "name length"
+        if k < _INNER.size + name_len:
+            return f"name letter {char(data[index])}"
+        if kind != KIND_TEXT:
+            return "file byte"
+        body = data[HEADER.size + _INNER.size + name_len:]
+        start = k - _INNER.size - name_len
+        while start > 0 and body[start] & 0xC0 == 0x80:  # back up to the start of a UTF-8 character
+            start -= 1
+        size = 1
+        while start + size < len(body) and body[start + size] & 0xC0 == 0x80:
+            size += 1
+        if size == 1:
+            return f"letter {char(body[start])}"
+        return f"letter '{body[start:start + size].decode('utf-8', errors='replace')}'"
 
     @property
     def pixels(self) -> int:
@@ -475,26 +587,30 @@ def locate(source: ImageSource, *, method: str | None = None) -> DataMap:
             flat[:_HEADER_SAMPLES] = 1
             end = _HEADER_SAMPLES + -(-length * 8 // depth)
             flat[_HEADER_SAMPLES:end] = (1 << depth) - 1
-            return DataMap("lsb", flat.reshape(h, w, 3), HEADER.size + length, depth)
+            stream = _read(carrier, 0, HEADER.size, 1) + _read(carrier, _HEADER_SAMPLES, length, depth)
+            return DataMap("lsb", flat.reshape(h, w, 3), HEADER.size + length, depth, stream=stream)
 
     found = _bpcs_header_of(img) if method != "lsb" else None
     if found is not None:
         arr, (_magic, _flags, length, _crc) = found
         try:
-            bits, blocks = bpcs.bit_map(arr, HEADER.size + length)
+            bits, order = bpcs.bit_map(arr, HEADER.size + length)
+            stream = bpcs.extract(arr, HEADER.size + length)
         except ValueError as exc:
             raise CorruptDataError("The hidden content runs past the end of the image.") from exc
-        return DataMap("bpcs", bits, HEADER.size + length, blocks=blocks)
+        return DataMap("bpcs", bits, HEADER.size + length, blocks=sum(o[2].size for o in order),
+                       stream=stream, order=tuple(order))
 
     if method == "bpcs":
         raise NoHiddenDataError()
     _decode_legacy(img)  # raises NoHiddenDataError unless the old format is plausible
     red = np.asarray(img, dtype=np.uint8)[..., 0].reshape(-1)
     usable = red.size - red.size % 8
-    stored = np.packbits(red[:usable] & 1).tobytes().find(LEGACY_TERMINATOR) + len(LEGACY_TERMINATOR)
+    raw = np.packbits(red[:usable] & 1).tobytes()
+    stored = raw.find(LEGACY_TERMINATOR) + len(LEGACY_TERMINATOR)
     bits = np.zeros((h * w, 3), dtype=np.uint8)
     bits[:stored * 8, 0] = 1
-    return DataMap("legacy", bits.reshape(h, w, 3), stored)
+    return DataMap("legacy", bits.reshape(h, w, 3), stored, stream=raw[:stored])
 
 
 # -------------------------------------------------------------------- legacy

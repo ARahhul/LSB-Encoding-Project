@@ -431,3 +431,35 @@ def test_locate_legacy(cover, tmp_path):
     data = core.locate(out)
     assert data.method == "legacy" and data.used == len(b"old school") + 4
     assert data.bits[..., 1:].sum() == 0  # red channel only
+
+
+@pytest.mark.parametrize("method", ["lsb", "bpcs"])
+def test_hidden_bits_point_at_the_stored_stream(photo_cover, tmp_path, method):
+    result = core.encode(photo_cover, core.TextSecret("Meet at 7pm"), tmp_path / "o.png", method=method)
+    data = core.locate(result.path)
+    after = np.asarray(Image.open(result.path), dtype=np.uint8)
+    values = after ^ (after >> 1) if method == "bpcs" else after
+    seen = set()
+    for y, x in zip(*np.nonzero(data.bits.any(axis=2))):
+        for hb in data.hidden_bits(int(x), int(y)):
+            if hb.kind != "data":
+                continue
+            stored = int(values[y, x, hb.channel]) >> hb.plane & 1
+            assert stored ^ hb.inverted == data.stream[hb.byte] >> (7 - hb.bit) & 1
+            seen.add(hb.index)
+    assert seen == set(range(data.used * 8))  # every stored bit is found exactly where it lives
+    assert core.decode(result.path).text == "Meet at 7pm"
+
+
+def test_describe_byte():
+    stream = core.build_container(core.TextSecret("Hé!"))
+    data = core.DataMap("lsb", np.zeros((1, 1, 3), np.uint8), len(stream), stream=stream)
+    words = [data.describe_byte(i) for i in range(len(stream))]
+    assert words[:4] == ["marker 'L'", "marker 'S'", "marker 'B'", "marker 0x02"]
+    assert words[4] == "flags byte" and words[5] == "length field" and words[9] == "CRC-32 check"
+    assert words[13] == "text/file type" and words[14] == words[15] == "name length"
+    assert words[16:] == ["letter 'H'", "letter 'é'", "letter 'é'", "letter '!'"]
+    locked = core.build_container(core.TextSecret("x"), password="pw")
+    data = core.DataMap("lsb", np.zeros((1, 1, 3), np.uint8), len(locked), stream=locked)
+    assert data.describe_byte(core.HEADER.size) == "encrypted byte"
+

@@ -47,7 +47,7 @@ from .widgets import (
     photo,
 )
 
-APP_NAME = "LSB Steganography"
+APP_NAME = "Steganography"
 APP_ID = "LSBSteganography.Desktop.2"
 METHOD_NAMES = {"lsb": "LSB", "bpcs": "BPCS"}
 MAX_SECRET_FILE = 100 * 1024 * 1024

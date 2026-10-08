@@ -385,3 +385,49 @@ def test_decode_with_a_chosen_method(photo_cover, cover, tmp_path):
         core.decode(bpcs_out, method="lsb")
     with pytest.raises(ValueError):
         core.decode(lsb_out, method="dct")
+
+
+# ------------------------------------------------------------------- locate
+
+@pytest.mark.parametrize("method", ["lsb", "bpcs"])
+def test_locate_covers_every_changed_bit(photo_cover, tmp_path, method):
+    result = core.encode(photo_cover, core.FileSecret("r.bin", os.urandom(1500)),
+                         tmp_path / "out.png", method=method)
+    data = core.locate(result.path)
+    assert data.method == method and data.used == result.used
+    before = np.asarray(Image.open(photo_cover), dtype=np.uint8)
+    after = np.asarray(Image.open(result.path), dtype=np.uint8)
+    if method == "bpcs":  # BPCS works on Gray-coded values
+        before, after = before ^ (before >> 1), after ^ (after >> 1)
+    changed = before ^ after
+    assert not (changed & ~data.bits).any()  # nothing changed outside the map
+    assert data.pixels <= data.bits.shape[0] * data.bits.shape[1]
+
+
+def test_locate_lsb_layout(cover, tmp_path):
+    result = core.encode(cover, core.TextSecret("hi"), tmp_path / "out.png")
+    data = core.locate(result.path)
+    flat = data.bits.reshape(-1)
+    stored = core.HEADER.size * 8 + (result.used - core.HEADER.size) * 8
+    assert (flat[:stored] == 1).all() and not flat[stored:].any()
+    assert data.planes == [0] and data.depth == 1
+
+
+def test_locate_bpcs_uses_whole_blocks(photo_cover, tmp_path):
+    result = core.encode(photo_cover, core.TextSecret("x" * 50), tmp_path / "out.png", method="bpcs")
+    data = core.locate(result.path)
+    assert data.blocks > 0
+    assert data.bits.astype(bool).sum() == data.blocks * 64  # one channel-plane per block
+
+
+def test_locate_without_data(photo_cover):
+    with pytest.raises(NoHiddenDataError):
+        core.locate(photo_cover)
+
+
+def test_locate_legacy(cover, tmp_path):
+    out = tmp_path / "legacy.png"
+    legacy_encode(cover, b"old school", out)
+    data = core.locate(out)
+    assert data.method == "legacy" and data.used == len(b"old school") + 4
+    assert data.bits[..., 1:].sum() == 0  # red channel only

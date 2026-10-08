@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import filedialog
 from typing import Any, Callable
 
+import numpy as np
 from PIL import Image, ImageGrab
 
 from .. import __version__, core
@@ -26,7 +27,7 @@ from ..errors import (
     StegoError,
     WrongPasswordError,
 )
-from . import dialogs, icons, sounds, winapi, widgets
+from . import datamap, dialogs, icons, sounds, winapi, widgets
 from . import theme as T
 from .chrome import XPChrome
 from .widgets import (
@@ -232,6 +233,7 @@ class App:
         self._refresh_hide()
         self._show_reveal_state("empty")
         self.reveal_button.set_enabled(False)
+        self.where_button.set_enabled(False)
         self._update_method_hint()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._present()
@@ -391,8 +393,10 @@ class App:
         self.reveal_pw_entry.grid(row=0, column=1, sticky="ew", padx=(T.px(6), T.px(8)))
         self.reveal_button = XPButton(pw_row, "Reveal", command=self.reveal)
         self.reveal_button.grid(row=0, column=2, sticky="e")
+        self.where_button = XPButton(pw_row, "Show Where…", command=self.show_data_map)
+        self.where_button.grid(row=0, column=3, sticky="e", padx=(T.px(6), 0))
         label(pw_row, "Only needed when the hidden content is password-protected.",
-              fg=T.TEXT_MUTED, anchor="w").grid(row=1, column=1, columnspan=2, sticky="w",
+              fg=T.TEXT_MUTED, anchor="w").grid(row=1, column=1, columnspan=3, sticky="w",
                                                 padx=(T.px(6), 0), pady=(T.px(3), 0))
         self.reveal_pw_entry.bind_entry("<Return>", lambda e: (self.reveal(), "break")[1])
 
@@ -520,6 +524,7 @@ class App:
             self.status.set(text)
         self._refresh_hide()
         self.reveal_button.set_enabled(not busy and self.inspected is not None)
+        self.where_button.set_enabled(not busy and self.inspected is not None and self.inspected.has_data)
 
     def _error(self, title: str, exc: BaseException) -> None:
         if isinstance(exc, FileNotFoundError):
@@ -830,6 +835,7 @@ class App:
             self._set_busy(False, f"Loaded {loaded.name}.")
             self.inspected = loaded
             self.reveal_button.set_enabled(self._busy == 0)
+            self.where_button.set_enabled(self._busy == 0 and loaded.has_data)
             self.reveal_zone.set_image(loaded.thumb)
             self.reveal_name.configure(text=ellipsize(loaded.name, T.FONT_BOLD, T.px(250)))
             self.reveal_details.configure(text=f"{loaded.width:,} × {loaded.height:,} pixels · {loaded.fmt}")
@@ -894,6 +900,31 @@ class App:
                 self._error("Reading the image failed.", exc)
 
         self.worker.run(lambda: core.decode(loaded.source, password, method=method), done, failed)
+
+    def show_data_map(self) -> None:
+        """Open the map of the pixels and bits that hold the hidden data."""
+        loaded = self.inspected
+        if loaded is None or self._busy:
+            return
+        self._set_busy(True, "Mapping the hidden data…")
+
+        def job():
+            img = core.open_image(loaded.source)
+            return np.asarray(img, dtype=np.uint8), core.locate(img)
+
+        def done(result) -> None:
+            rgb, data = result
+            self._set_busy(False, f"The hidden data is in {data.pixels:,} pixels.")
+            datamap.show(self.root, loaded.name, rgb, data)
+
+        def failed(exc: BaseException) -> None:
+            self._set_busy(False)
+            if isinstance(exc, NoHiddenDataError):
+                dialogs.message(self.root, APP_NAME, "There is no hidden data to show in this picture.")
+            else:
+                self._error("Could not map the hidden data.", exc)
+
+        self.worker.run(job, done, failed)
 
     def _show_reveal_state(self, state: str, extra: str = "") -> None:
         method = METHOD_NAMES[self.method.get()]

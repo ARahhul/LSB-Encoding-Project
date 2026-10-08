@@ -106,6 +106,24 @@ header (with magic `BPC\x01`), compression, password protection and integrity ch
 says so and offers a one-click *Use BPCS* / *Use LSB* button. `lsb-decode` detects the method
 by itself.
 
+### See where the data is
+
+On the **Reveal** tab, **Show Where…** opens a map of the picture with every pixel that holds
+hidden data marked in red. No password is needed, because the header that says where the
+data is isn't encrypted.
+
+* **Map:** the whole picture, washed out to grey, with the data pixels in red. When the
+  picture is shrunk to fit, a single data pixel still shows.
+* **Magnifier:** the 15×15 pixels around the selected one, drawn large, with data pixels
+  outlined in red.
+* **Selected pixel:** its red, green and blue values as 8 bits each, with the bits that hold
+  hidden data filled in red. For LSB that's the lowest bit (or two). For BPCS it's one bit of
+  the Gray-coded value, in one channel only, because BPCS works on whole 8×8 blocks of a
+  single bit-plane.
+
+Click the map or the magnifier to pick a pixel, or move with the arrow keys (Shift+arrow moves 8
+pixels). **Save Map…** saves the full-size map as a PNG.
+
 ## Fixed from the original scripts
 
 * `requirements.txt` held a shell command instead of a package list. It's replaced by Poetry.
@@ -160,6 +178,7 @@ lsb_stego/
     skin.py       renders every control face with Pillow
     icons.py      app icon and XP message-box icons (python -m lsb_stego.gui.icons out.ico)
     dialogs.py    XP message boxes
+    datamap.py    Show Where… window: data map, magnifier, bit view
     winapi.py     taskbar button, rounded corners, minimise (ctypes)
     sounds.py     XP-style startup chime, button click and typing taps
 tests/            pytest suite

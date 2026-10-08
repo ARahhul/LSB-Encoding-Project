@@ -146,26 +146,50 @@ def embed(rgb: np.ndarray, data: bytes) -> int:
     return done
 
 
+def _holding(gray: np.ndarray, count: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
+    """(plane, channel, blocks, indices) of the blocks holding the first ``count`` bytes."""
+    needed = -(-count * 8 // DATA_BITS)
+    found = []
+    have = 0
+    if gray.size:
+        for plane, channel, blocks, idx in _noisy(gray):
+            take = idx[:needed - have]
+            if take.size:
+                found.append((plane, channel, blocks, take))
+                have += take.size
+            if have == needed:
+                break
+    if have < needed:
+        raise ValueError("the picture ends before the hidden data does")
+    return found
+
+
 def extract(rgb: np.ndarray, count: int) -> bytes:
     """The first ``count`` bytes hidden by :func:`embed`.
 
     Raises ValueError if the picture has fewer noisy blocks than that needs.
     """
-    needed = -(-count * 8 // DATA_BITS)
-    gray = _gray_area(rgb)
-    found: list[np.ndarray] = []
-    have = 0
-    if gray.size:
-        for _plane, _channel, blocks, idx in _noisy(gray):
-            take = idx[:needed - have]
-            found.append(blocks[take])
-            have += take.size
-            if have == needed:
-                break
-    if have < needed:
-        raise ValueError("the picture ends before the hidden data does")
+    found = [blocks[take] for _p, _c, blocks, take in _holding(_gray_area(rgb), count)]
     blocks = np.concatenate(found) if found else np.zeros((0, BLOCK, BLOCK), np.uint8)
     flagged = blocks[:, 0, 0] == 1
     blocks[flagged] ^= CHECKERBOARD
     bits = blocks.reshape(-1, BLOCK * BLOCK)[:, 1:].reshape(-1)[:count * 8]
     return np.packbits(bits).tobytes()
+
+
+def bit_map(rgb: np.ndarray, count: int) -> tuple[np.ndarray, int]:
+    """Where the first ``count`` hidden bytes are, and how many blocks hold them.
+
+    The map is (height, width, 3) uint8: bit ``k`` of ``map[y, x, c]`` is set
+    when bit-plane ``k`` of that channel's Gray-coded value carries data.
+    """
+    out = np.zeros((rgb.shape[0], rgb.shape[1], 3), dtype=np.uint8)
+    gray = _gray_area(rgb)
+    h, w = gray.shape[:2]
+    holding = _holding(gray, count)
+    for plane, channel, _blocks, take in holding:
+        used = np.zeros((h // BLOCK) * (w // BLOCK), dtype=bool)
+        used[take] = True
+        used = used.reshape(h // BLOCK, w // BLOCK).repeat(BLOCK, axis=0).repeat(BLOCK, axis=1)
+        out[:h, :w, channel] |= used.astype(np.uint8) << np.uint8(plane)
+    return out, sum(take.size for *_, take in holding)

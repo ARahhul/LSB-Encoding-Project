@@ -108,6 +108,36 @@ class Revealed:
 
 
 @dataclass(frozen=True)
+class DataMap:
+    """Which bits of which pixels hold hidden data (see :func:`locate`).
+
+    ``bits[y, x, c]`` is a mask over the 8 bits of channel ``c`` (R, G, B) of
+    the pixel at (x, y): bit ``k`` set means bit ``k`` carries hidden data. For
+    BPCS those are the bits of the Gray-coded value, which is where BPCS works.
+    """
+    method: str           # "lsb", "bpcs" or "legacy"
+    bits: np.ndarray      # (height, width, 3) uint8
+    used: int             # bytes stored, header included
+    depth: int = 1        # LSB: bits per channel for the payload
+    blocks: int = 0       # BPCS: 8x8 blocks holding data
+
+    @property
+    def gray(self) -> bool:
+        return self.method == "bpcs"
+
+    @property
+    def pixels(self) -> int:
+        """Pixels with at least one hidden bit."""
+        return int(np.count_nonzero(self.bits.any(axis=2)))
+
+    @property
+    def planes(self) -> list[int]:
+        """Bit positions in use, lowest first."""
+        used = int(np.bitwise_or.reduce(self.bits, axis=None)) if self.bits.size else 0
+        return [k for k in range(8) if used >> k & 1]
+
+
+@dataclass(frozen=True)
 class EncodeResult:
     path: Path
     used: int          # bytes written, header included
@@ -421,6 +451,50 @@ def decode(source: ImageSource, password: str | None = None, *,
     if method == "bpcs":
         raise NoHiddenDataError()
     return _decode_legacy(img)
+
+
+def locate(source: ImageSource, *, method: str | None = None) -> DataMap:
+    """Map where :func:`decode` would find hidden data, bit by bit.
+
+    No password is needed: the header that says where the data is isn't
+    encrypted. Raises :class:`NoHiddenDataError` if there is nothing to map.
+    """
+    if method is not None and method not in METHODS:
+        raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}.")
+    img = open_image(source)
+    carrier = _carrier(img)
+    h, w = img.height, img.width
+
+    if method != "bpcs" and carrier.size >= _HEADER_SAMPLES:
+        magic, flags, length, _crc = HEADER.unpack(_read(carrier, 0, HEADER.size, 1))
+        if magic == MAGIC:
+            depth = ((flags & DEPTH_MASK) >> DEPTH_SHIFT) + 1
+            if length > capacity_for_size(w, h, depth) - HEADER.size:
+                raise CorruptDataError("The hidden content's length is larger than the image.")
+            flat = np.zeros(carrier.size, dtype=np.uint8)
+            flat[:_HEADER_SAMPLES] = 1
+            end = _HEADER_SAMPLES + -(-length * 8 // depth)
+            flat[_HEADER_SAMPLES:end] = (1 << depth) - 1
+            return DataMap("lsb", flat.reshape(h, w, 3), HEADER.size + length, depth)
+
+    found = _bpcs_header_of(img) if method != "lsb" else None
+    if found is not None:
+        arr, (_magic, _flags, length, _crc) = found
+        try:
+            bits, blocks = bpcs.bit_map(arr, HEADER.size + length)
+        except ValueError as exc:
+            raise CorruptDataError("The hidden content runs past the end of the image.") from exc
+        return DataMap("bpcs", bits, HEADER.size + length, blocks=blocks)
+
+    if method == "bpcs":
+        raise NoHiddenDataError()
+    _decode_legacy(img)  # raises NoHiddenDataError unless the old format is plausible
+    red = np.asarray(img, dtype=np.uint8)[..., 0].reshape(-1)
+    usable = red.size - red.size % 8
+    stored = np.packbits(red[:usable] & 1).tobytes().find(LEGACY_TERMINATOR) + len(LEGACY_TERMINATOR)
+    bits = np.zeros((h * w, 3), dtype=np.uint8)
+    bits[:stored * 8, 0] = 1
+    return DataMap("legacy", bits.reshape(h, w, 3), stored)
 
 
 # -------------------------------------------------------------------- legacy

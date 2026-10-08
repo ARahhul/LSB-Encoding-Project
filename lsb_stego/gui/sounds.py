@@ -1,8 +1,8 @@
-"""Windows XP style sounds: a startup chime and the button click.
+"""Windows XP style sounds: a startup chime, the button click and key taps.
 
 Microsoft's own XP sound files can't ship with the app, so both sounds are
 synthesised here and cached as WAV files. To use the real ones, drop
-``startup.wav`` and/or ``click.wav`` into the ``sounds`` folder next to the
+``startup.wav``, ``click.wav`` and/or ``key.wav`` into the ``sounds`` folder next to the
 error log (``%LOCALAPPDATA%\\LSB Steganography\\sounds``); those win. For the
 click, Windows' own "Windows Navigation Start.wav" (XP's Start.wav) is used
 when present.
@@ -25,7 +25,7 @@ IS_WINDOWS = sys.platform == "win32"
 RATE = 44100
 SOUND_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "LSB Steganography" / "sounds"
 _SYSTEM_CLICK = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Media" / "Windows Navigation Start.wav"
-_VERSION = "1"  # bump when the synthesis changes so stale caches are rewritten
+_VERSION = "2"  # bump when the synthesis changes so stale caches are rewritten
 
 enabled = True
 _paths: dict[str, Path | None] = {}
@@ -99,7 +99,19 @@ def click_wav() -> bytes:
     return _wav_bytes(np.column_stack([sig, sig]))
 
 
-_SYNTH = {"startup": startup_wav, "click": click_wav}
+def key_wav() -> bytes:
+    """A soft keyboard tap for typing: quieter and duller than the click."""
+    n = int(0.03 * RATE)
+    t = np.arange(n) / RATE
+    rng = np.random.default_rng(11)
+    sig = 0.5 * np.sin(2 * np.pi * 1500 * t) * np.exp(-t * 220)
+    sig += 0.5 * np.sin(2 * np.pi * 420 * t) * np.exp(-t * 160)
+    sig += 0.35 * rng.uniform(-1, 1, n) * np.exp(-t * 600)
+    sig = sig / np.abs(sig).max() * 0.3
+    return _wav_bytes(np.column_stack([sig, sig]))
+
+
+_SYNTH = {"startup": startup_wav, "click": click_wav, "key": key_wav}
 
 
 def path_for(name: str) -> Path | None:
@@ -146,6 +158,35 @@ def play_click() -> None:
         winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
     except RuntimeError:
         pass
+
+
+def play_key() -> None:
+    """Typing tap. Shares PlaySound with the click, so fast typing restarts it."""
+    if not (enabled and IS_WINDOWS):
+        return
+    path = path_for("key")
+    if path is None:
+        return
+    try:
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except RuntimeError:
+        pass
+
+
+_TYPING_KEYS = {"BackSpace", "Delete", "Return", "KP_Enter", "Tab"}
+
+
+def on_key(event) -> None:
+    """``<Key>`` handler: tap when a character is typed into an editable field."""
+    import tkinter as tk
+
+    widget = event.widget
+    if not isinstance(widget, (tk.Entry, tk.Text)) or str(widget.cget("state")) == "disabled":
+        return
+    if event.state & 0x4:  # Ctrl shortcuts (copy, paste, select all) are not typing
+        return
+    if (event.char and event.char.isprintable()) or event.keysym in _TYPING_KEYS:
+        play_key()
 
 
 def play_startup() -> None:

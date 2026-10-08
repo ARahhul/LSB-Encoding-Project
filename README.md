@@ -106,11 +106,12 @@ videos, are detected from a sample and stored as they are rather than being zipp
 
 ## Sounds
 
-On Windows the app plays an XP-style startup chime when it opens and a click when you press a
-button. Both are synthesised by the app (Microsoft's own XP sound files can't be bundled). To
-use the real ones, copy them to `%LOCALAPPDATA%\LSB Steganography\sounds\` as `startup.wav`
-and `click.wav`. If no `click.wav` is there, Windows' own *Windows Navigation Start.wav* (the
-XP click) is used when available.
+On Windows the app plays an XP-style startup chime when it opens, a click when you press a
+button and a soft key tap as you type in a text box. All three are synthesised by the app
+(Microsoft's own XP sound files can't be bundled). To use your own, copy them to
+`%LOCALAPPDATA%\LSB Steganography\sounds\` as `startup.wav`, `click.wav` and `key.wav`. If no
+`click.wav` is there, Windows' own *Windows Navigation Start.wav* (the XP click) is used when
+available.
 
 ## Project layout
 
@@ -127,6 +128,6 @@ lsb_stego/
     icons.py      app icon and XP message-box icons (python -m lsb_stego.gui.icons out.ico)
     dialogs.py    XP message boxes
     winapi.py     taskbar button, rounded corners, minimise (ctypes)
-    sounds.py     XP-style startup chime and button click
+    sounds.py     XP-style startup chime, button click and typing taps
 tests/            pytest suite
 ```

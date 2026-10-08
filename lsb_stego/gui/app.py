@@ -26,7 +26,7 @@ from ..errors import (
     StegoError,
     WrongPasswordError,
 )
-from . import dialogs, icons, winapi, widgets
+from . import dialogs, icons, sounds, winapi, widgets
 from . import theme as T
 from .chrome import XPChrome
 from .widgets import (
@@ -448,6 +448,7 @@ class App:
         winapi.round_top_corners(root, T.px(7))
         winapi.bring_to_front(root)
         self.message.text.focus_set()
+        sounds.play_startup()
 
     # ============================================================ keyboard
     def _bind_keys(self) -> None:
@@ -941,6 +942,7 @@ class App:
                                      kind="warning", buttons=("Quit", "Cancel"), default=1, cancel="Cancel")
             if choice != "Quit":
                 return
+        sounds.close()
         self.root.destroy()
 
 

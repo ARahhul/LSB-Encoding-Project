@@ -120,3 +120,15 @@ def test_reveal_shows_text(app_factory, tmp_path):
     app._show_revealed(core.decode(result.path))
     assert app.revealed_text.get_text() == "shown in the box"
     assert "verified" in app.text_info.cget("text")
+
+
+def test_sounds_synthesise_valid_wavs():
+    import io
+    import wave
+
+    from lsb_stego.gui import sounds
+
+    for make, min_secs, max_secs in ((sounds.startup_wav, 3.0, 6.0), (sounds.click_wav, 0.01, 0.2)):
+        with wave.open(io.BytesIO(make())) as w:
+            assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (2, 2, sounds.RATE)
+            assert min_secs <= w.getnframes() / w.getframerate() <= max_secs

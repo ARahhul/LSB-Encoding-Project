@@ -8,7 +8,7 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
-from . import icons, skin
+from . import icons, skin, sounds
 from . import theme as T
 
 try:
@@ -143,6 +143,7 @@ class XPButton(tk.Canvas):
     # public API
     def invoke(self) -> None:
         if self._enabled and self._command:
+            sounds.play_click()
             self._command()
 
     def set_enabled(self, enabled: bool) -> None:

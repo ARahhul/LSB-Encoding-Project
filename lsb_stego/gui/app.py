@@ -463,6 +463,7 @@ class App:
         r.bind("<Control-V>", self._on_paste_key, add="+")
         r.bind("<Alt-F4>", lambda e: self.close())
         r.bind("<F1>", lambda e: self.about())
+        r.bind_all("<Key>", sounds.on_key, add="+")
 
     def _on_return(self, event) -> None:
         if isinstance(event.widget, (tk.Text, XPButton)):
